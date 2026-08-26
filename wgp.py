@@ -44,7 +44,7 @@ from pathlib import Path
 from datetime import datetime
 import gradio as gr
 from shared.gradio import downloads as gradio_downloads
-from shared.gradio import gradio_model_switch_patch, gradio_queue_focus_patch, video_preview
+from shared.gradio import gradio_model_switch_patch, gradio_queue_focus_patch, video_preview, connection_keepalive
 from gradio.themes.utils.sizes import Size
 import random
 import json
@@ -2661,6 +2661,7 @@ server_config.setdefault(gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY,
 gradio_queue_focus_patch.BACKGROUND_SCHEDULER_DEFAULT_ENABLED = bool(server_config.get(gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY, 1))
 gradio_queue_focus_patch.install()
 gradio_model_switch_patch.install(verbose=ui_perf_debug)
+connection_keepalive.install()
 
 checkpoints_paths = server_config.get("checkpoints_paths", None)
 if checkpoints_paths is None: checkpoints_paths = server_config["checkpoints_paths"] = fl.default_checkpoints_paths
@@ -13892,6 +13893,11 @@ if __name__ == "__main__":
     if len(server_name) == 0:
         server_name = os.getenv("SERVER_NAME", "localhost")
     demo = create_ui()
+    demo.queue(
+        status_update_rate=1,
+        default_concurrency_limit=1,
+        api_open=True,
+    )
     clear_startup_lock()
     if args.open_browser:
         import webbrowser
@@ -13906,4 +13912,5 @@ if __name__ == "__main__":
         server_port=server_port,
         share=args.share,
         allowed_paths=list({save_path, image_save_path, audio_save_path, "icons"}),
+        server_kwargs={"timeout_keep_alive": 86400},
     )
