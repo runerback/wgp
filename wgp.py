@@ -13732,7 +13732,7 @@ if __name__ == "__main__":
         )
 
     # CLI Queue Processing Mode
-    if len(args.process) > 0:
+    while len(args.process) > 0:
         download_ffmpeg()  # Still needed for video encoding
 
         if not os.path.isfile(args.process):
@@ -13824,7 +13824,10 @@ if __name__ == "__main__":
 
         try:
             success = process_tasks_cli(queue, state)
-            sys.exit(0 if success else 1)
+            if not success:
+                sys.exit(1)
+            # end if
+            input("press ENTER to handle next queue file, or CTRL+C to exit")
         except KeyboardInterrupt:
             print("\n\nAborted by user")
             sys.exit(130)
