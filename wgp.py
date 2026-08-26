@@ -13906,11 +13906,24 @@ if __name__ == "__main__":
         else:
             url = "http://" + server_name
         webbrowser.open(url + ":" + str(server_port), new = 0, autoraise = True)
+
+    # Gradio passes app_kwargs to the FastAPI app, not to uvicorn, so
+    # timeout_keep_alive is ignored. Patch uvicorn.Config to inject it.
+    import uvicorn
+    from uvicorn.config import Config as UvicornConfig
+
+    _orig_uvicorn_config_init = UvicornConfig.__init__
+
+    def _uvicorn_config_init_with_keepalive(self, app, **kwargs):
+        kwargs.setdefault("timeout_keep_alive", 86400)
+        _orig_uvicorn_config_init(self, app, **kwargs)
+
+    UvicornConfig.__init__ = _uvicorn_config_init_with_keepalive
+
     demo.launch(
         favicon_path="favicon.png",
         server_name=server_name,
         server_port=server_port,
         share=args.share,
         allowed_paths=list({save_path, image_save_path, audio_save_path, "icons"}),
-        app_kwargs={"timeout_keep_alive": 86400},
     )
