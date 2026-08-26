@@ -2332,7 +2332,7 @@ def finalize_generation_with_state(current_state):
              gr.update(interactive=True),
              gr.update(interactive=True),
              gr.update(visible=True),
-             gr.update(visible=False),
+             gr.update(visible=True),
              gr.update(visible=False),
              gr.update(visible=False, value=""),
              gr.update(),
@@ -4445,7 +4445,7 @@ def refresh_gallery(state): #, msg
         output_tabs = [gr.update(), gr.update()]
 
     if not in_progress or len(queue) == 0:
-        return *output_tabs, gr.Gallery(value = file_list) if last_was_audio else gr.Gallery(selected_index=choice, value = file_list), gr.update() if last_was_audio else choice, *pack_audio_gallery_state(audio_file_list, audio_choice), gr.HTML("", visible= False),  gr.Button(visible=True), gr.Button(visible=False), gr.Row(visible=False), gr.Row(visible=False), update_queue_data(queue), gr.Button(interactive=  abort_interactive), gr.Button(interactive=  early_stop_interactive, visible= early_stop_visible), gr.Button(visible= False)
+        return *output_tabs, gr.Gallery(value = file_list) if last_was_audio else gr.Gallery(selected_index=choice, value = file_list), gr.update() if last_was_audio else choice, *pack_audio_gallery_state(audio_file_list, audio_choice), gr.HTML("", visible= False),  gr.Button(visible=True), gr.Button(visible=True), gr.Row(visible=False), gr.Row(visible=False), update_queue_data(queue), gr.Button(interactive=  abort_interactive), gr.Button(interactive=  early_stop_interactive, visible= early_stop_visible), gr.Button(visible= False)
     else:
         task = queue[0]
         prompt =  task["prompt"]
@@ -4548,7 +4548,7 @@ def finalize_generation(state):
     gen_in_progress = False
     gen["early_stop"] = False
     gen["early_stop_forwarded"] = False
-    return gallery_tabs, 1 if last_was_audio else 0, gr.update() if last_was_audio else gr.Gallery(value=gen.get("file_list", []), selected_index=choice),  *pack_audio_gallery_state(audio_file_list, audio_choice), gr.Button(interactive=  True), gr.Button(interactive=  True, visible= False), gr.Button(visible= True), gr.Button(visible= False), gr.Column(visible= False), gr.HTML(visible= False, value="")
+    return gallery_tabs, 1 if last_was_audio else 0, gr.update() if last_was_audio else gr.Gallery(value=gen.get("file_list", []), selected_index=choice),  *pack_audio_gallery_state(audio_file_list, audio_choice), gr.Button(interactive=  True), gr.Button(interactive=  True, visible= False), gr.Button(visible= True), gr.Button(visible= True), gr.Column(visible= False), gr.HTML(visible= False, value="")
 
 def get_default_video_info():
     return "Please Select a Video / Image"    
@@ -8413,7 +8413,7 @@ def generate_media(
 def prepare_generate_media(state):
 
     if state.get("validate_success",0) != 1:
-        return gr.Button(visible= True), gr.Button(visible= False), gr.Column(visible= False), gr.update(visible=False)
+        return gr.Button(visible= True), gr.Button(visible= True), gr.Column(visible= False), gr.update(visible=False)
     else:
         return gr.Button(visible= False), gr.Button(visible= True), gr.Column(visible= True), gr.update(visible= False)
 
@@ -10893,13 +10893,13 @@ def refresh_preview(state):
     """
     return html_content
 
-def init_process_queue_if_any(state):                
+def init_process_queue_if_any(state):
     gen = get_gen_info(state)
     if bool(gen.get("queue",[])):
         state["validate_success"] = 1
-        return gr.Button(visible=False), gr.Button(visible=True), gr.Column(visible=True)                   
+        return gr.Button(visible=False), gr.Button(visible=True), gr.Column(visible=True)
     else:
-        return gr.Button(visible=True), gr.Button(visible=False), gr.Column(visible=False)
+        return gr.Button(visible=True), gr.Button(visible=True), gr.Column(visible=False)
 
 def get_modal_image(image_base64, label):
     return f"""
@@ -12655,8 +12655,10 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                             video_info_add_videos_btn = gr.Button("Import Videos / Images / Audio Files", size ="sm")
  
             if not update_form:
-                generate_btn = gr.Button("Generate")
-                add_to_queue_btn = gr.Button("Add New Prompt To Queue", visible=False)
+                with gr.Row():
+                    generate_btn = gr.Button("Generate")
+                    add_to_queue_btn = gr.Button("Add to Queue")
+                # end with
                 generate_trigger = gr.Text(visible = False) 
                 add_to_queue_trigger = gr.Text(visible = False)
                 js_trigger_index = gr.Text(visible=False, elem_id="js_trigger_for_edit_refresh")
