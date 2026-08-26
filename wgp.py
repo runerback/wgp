@@ -8954,7 +8954,7 @@ def clear_status(state):
 
 def get_latest_status(state, context=""):
     gen = get_gen_info(state)
-    prompt_no = gen["prompt_no"] 
+    prompt_no = gen.get("prompt_no", 0)
     prompts_max = gen.get("prompts_max",0)
     total_generation = gen.get("total_generation", 1)
     repeat_no = gen.get("repeat_no",0)
@@ -13912,5 +13912,5 @@ if __name__ == "__main__":
         server_port=server_port,
         share=args.share,
         allowed_paths=list({save_path, image_save_path, audio_save_path, "icons"}),
-        server_kwargs={"timeout_keep_alive": 86400},
+        app_kwargs={"timeout_keep_alive": 86400},
     )
