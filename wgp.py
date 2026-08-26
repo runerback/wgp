@@ -88,6 +88,7 @@ from shared.utils.wgp_config_migration import migrate_extension_defaults
 from shared.utils import files_locator as fl 
 from shared.gradio.audio_gallery import AudioGallery  
 from shared.utils.self_refiner import normalize_self_refiner_plan, ensure_refiner_list, add_refiner_rule, remove_refiner_rule
+from shared.utils.copyfile import copyfile
 from shared.deepy import controller as deepy_controller
 from shared.deepy import filesystem as deepy_filesystem
 from shared.deepy import cli as deepy_cli
@@ -1834,13 +1835,12 @@ def _load_task_attachments(params, media_base_path, cache_dir=None, log_prefix="
 
             if cache_dir:
                 final_path = os.path.join(cache_dir, os.path.basename(source_name))
-                try:
-                    shutil.copy2(source_path, final_path)
-                except Exception as e:
-                    print(f"{log_prefix} Error copying {filename}: {e}")
+                if not copyfile(source_path, final_path, filename, log_prefix):
                     continue
+                # end if
             else:
                 final_path = source_path
+            # end if
 
             # Load images as PIL, keep videos/audio as paths
             if key == "video_source" and preserve_edit_media_source_path:
