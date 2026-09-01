@@ -13740,10 +13740,32 @@ if __name__ == "__main__":
             )
         )
 
+    if len(args.process) > 0:
+        download_ffmpeg()  # Still needed for video encoding
+    # end if
+
+    def _input_with_timeout(prompt, timeout):
+        result = [None]
+        interrupted = [False]
+        event = threading.Event()
+
+        def _reader():
+            try:
+                result[0] = input(prompt)
+            except KeyboardInterrupt:
+                interrupted[0] = True
+            finally:
+                event.set()
+
+        thread = threading.Thread(target=_reader, daemon=True)
+        thread.start()
+        event.wait(timeout=timeout)
+        if interrupted[0]:
+            raise KeyboardInterrupt
+        return result[0]
+
     # CLI Queue Processing Mode
     while len(args.process) > 0:
-        download_ffmpeg()  # Still needed for video encoding
-
         if not os.path.isfile(args.process):
             print(f"[ERROR] File not found: {args.process}")
             sys.exit(1)
@@ -13836,7 +13858,9 @@ if __name__ == "__main__":
             if not success:
                 sys.exit(1)
             # end if
-            input("press ENTER to handle next queue file, or CTRL+C to exit")
+            if _input_with_timeout("press ENTER to handle next queue file, or CTRL+C to exit (timeout: 30 min)", 1800) is None:
+                print("\n\nTimeout: no input for 30 minutes, exiting.")
+                sys.exit(0)
         except KeyboardInterrupt:
             print("\n\nAborted by user")
             sys.exit(130)
