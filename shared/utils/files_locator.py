@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 from functools import lru_cache
 import os
@@ -205,6 +206,12 @@ def locate_folder(folder_name, error_if_none = True):
             searched_locations.append(os.path.abspath(path))
     if error_if_none: raise Exception(f"Unable to locate folder '{folder_name}', tried {searched_locations}")    
     return None
+
+
+def installed_copies(relative_path):
+    """All installed copies of one declared checkpoint path, including lower-priority roots."""
+    candidates = [relative_path] if os.path.isabs(relative_path) else [os.path.join(root, relative_path) for root in _checkpoints_paths]
+    return [candidate for candidate in candidates if os.path.isfile(candidate)]
 
 
 def locate_file(file_name, create_path_if_none = False, error_if_none = True, extra_paths = None):

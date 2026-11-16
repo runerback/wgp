@@ -1,8 +1,21 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """Control preprocessing and its on-demand assets."""
 
 import torch
 from shared.utils import files_locator as fl
 from shared.utils.download import process_files_def_if_needed
+
+DEPTH_VARIANT_CHOICES = [
+    ("Depth Anything 2 Large (more precise, slower)", "vitl"),
+    ("Depth Anything 2 Big (less precise, faster)", "vitb"),
+    ("Depth Anything 3 Metric Large (better temporal stability ?)", "da3_metric_large"),
+]
+
+
+def depth_checkpoint_inventory():
+    for label, variant in DEPTH_VARIANT_CHOICES:
+        yield {"name": "Depth Anything", "variant": label.removeprefix("Depth Anything ").split(" (")[0],
+               "download_defs": [query_preprocessor_download_def("depth", {"depth_anything_v2_variant": variant})]}
 
 
 def query_preprocessor_download_def(process_type, server_config=None):

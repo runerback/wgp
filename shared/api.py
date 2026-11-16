@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """Lightweight in-process API wrapper around WanGP generation."""
 
 from __future__ import annotations
@@ -25,7 +26,8 @@ from typing import Any, Iterator, Sequence
 from PIL import Image
 from shared.tinyvae.media import VideoPreview
 
-from shared.utils.frame_scheduler import normalize_output_frame_count
+from shared.utils.frame_scheduler import fit_video_length, normalize_output_frame_count
+from shared.utils.gallery_sources import GALLERY_SOURCES, gallery_state_defaults
 from shared.utils.process_locks import set_main_generation_running
 from shared.utils.virtual_media import get_virtual_media_vsource, parse_virtual_media_path, replace_virtual_media_source
 
@@ -146,7 +148,7 @@ def apply_video_length_duration(settings: dict[str, Any], model_def: dict[str, A
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError("A positive numeric force_fps or model fps is required when video_length uses seconds")
     requested_frames = int(round(seconds * fps))
-    frames = normalize_output_frame_count(requested_frames, model_def.get("frames_minimum", 5), model_def.get("frames_steps", 4), model_def.get("frames_offset", 1))
+    frames = fit_video_length(requested_frames, model_def.get("frames_minimum", 5), model_def.get("frames_steps", 4), model_def.get("frames_offset", 1))
     settings["video_length"] = frames
     return {"input": raw_value, "seconds": seconds, "fps": fps, "frames": frames}
 
@@ -187,6 +189,11 @@ class ProgressUpdate:
     total_steps: int | None
     raw_phase: str | None = None
     unit: str | None = None
+    task_id: str | None = None
+    task_index: int | None = None
+    task_count: int | None = None
+    window_index: int | None = None
+    window_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -580,6 +587,8 @@ class WanGPSession:
         console_output: bool = True,
         console_isatty: bool = True,
         webui_state: dict[str, Any] | None = None,
+        webui_append: bool = False,
+        webui_concurrent: bool = False,
     ) -> None:
         self._root = Path(root or Path(__file__).resolve().parents[1]).resolve()
         self._config_path = Path(config_path).resolve() if config_path is not None else (self._root / "wgp_config.json").resolve()
@@ -589,6 +598,10 @@ class WanGPSession:
         self._console_output = bool(console_output)
         self._console_isatty = bool(console_isatty)
         self._use_webui_queue = isinstance(webui_state, dict)
+        # Like the UI's Add to Queue: jobs append in order and several may wait, instead of one priority job.
+        self._webui_append = self._use_webui_queue and webui_append
+        # Several priority jobs may wait too (a remote Deepy engine's background jobs): the queue keeps them in order.
+        self._webui_concurrent = self._webui_append or (self._use_webui_queue and webui_concurrent)
         self._state = webui_state if isinstance(webui_state, dict) else self._create_headless_state()
         self._active_job: SessionJob | None = None
         self._job_lock = threading.Lock()
@@ -598,10 +611,14 @@ class WanGPSession:
         self._ensure_runtime()
         return self
 
-    def list_model_defs(self, *, family: str | Sequence[str] | None = None, base_model_type: str | Sequence[str] | None = None, finetune: bool | str | None = None, model_type: str | Sequence[str] | None = None, main_output: str | Sequence[str] | None = None, inputs: str | Sequence[str] | None = None, name: str | Sequence[str] | None = None, query: str | None = None, limit: int | None = None, offset: int = 0) -> list[dict[str, Any]]:
+    def list_model_defs(self, *, family: str | Sequence[str] | None = None, base_model_type: str | Sequence[str] | None = None, finetune: bool | str | None = None, model_type: str | Sequence[str] | None = None, main_output: str | Sequence[str] | None = None, inputs: str | Sequence[str] | None = None, name: str | Sequence[str] | None = None, query: str | None = None, resolution: str | None = None, include_resolution_unknown: bool = False, limit: int | None = None, offset: int = 0) -> list[dict[str, Any]]:
+        from shared.resolutions import assess_resolution, parse_resolution
+        if resolution is not None:
+            parse_resolution(resolution)
         runtime = self._ensure_runtime()
         with _pushd(runtime.root):
             records = _strip_model_def_callables(runtime.module.list_model_defs(family=family, base_model_type=base_model_type, finetune=finetune, model_type=model_type, main_output=main_output, inputs=inputs))
+        records = [record for record in records if record.get("visible", True)]  # as in the model selector; get_model_def still reads a hidden model by its id
         name_patterns = [str(value).strip().casefold() for value in (name if isinstance(name, (list, tuple, set)) else [name]) if value is not None and str(value).strip()]
         query_text = str(query or "").strip().casefold()
         if name_patterns:
@@ -617,6 +634,16 @@ class WanGPSession:
                     )
                 )
             ]
+        if resolution is not None:
+            selected = []
+            for record in records:
+                if not any(kind in ("image", "video") for kind in record["metadata"]["main_output"]):
+                    continue
+                assessment = assess_resolution(record, resolution)
+                if assessment["status"] == "recommended" or include_resolution_unknown and assessment["status"] == "unknown":
+                    record["metadata"]["resolution_assessment"] = assessment
+                    selected.append(record)
+            records = selected
         offset = max(0, int(offset or 0))
         if limit is None:
             return records[offset:]
@@ -746,6 +773,14 @@ class WanGPSession:
     def get_exported_default_settings(self, model_type: str) -> dict[str, Any]:
         return self.prepare_settings_for_export(self.get_default_settings(model_type))
 
+    def get_lora_dir(self, model_type: str) -> str:
+        """The LoRA folder of a model (raises for unknown models and models without LoRA support)."""
+        runtime = self._ensure_runtime()
+        with _pushd(runtime.root):
+            if runtime.module.get_model_def(model_type) is None:
+                raise ValueError(f"Unknown model_type: {model_type}")
+            return str(runtime.module.get_lora_dir(model_type))
+
     def list_loras(self, model_type: str, name: str | Sequence[str] | None = None) -> dict[str, Any]:
         runtime = self._ensure_runtime()
         with _pushd(runtime.root):
@@ -800,6 +835,7 @@ class WanGPSession:
             "infos": str(model_def.get("infos", "") or ""),
             "prompt_infos": str(model_def.get("prompt_infos", "") or ""),
             "sliding_window": bool(model_def.get("sliding_window", False)),
+            **({"prompt_optional": True} if model_def.get("prompt_optional") else {}),
         })
         if "video" in metadata.get("outputs", []):
             metadata["frames_maximum"] = _model_frames_maximum(self._ensure_runtime().module, model_type, model_def)
@@ -814,8 +850,8 @@ class WanGPSession:
         task = self._normalize_task(settings, task_index=1)
         return self._submit_tasks([self._absolutize_task_paths(task, caller_base_path)], callbacks=callbacks)
 
-    def submit_media_postprocessing(self, media_source: str | os.PathLike[str], *, temporal_upsampling: str = "", spatial_upsampling: str = "", spatial_upsampler_prompt: str = "", spatial_upsampler_reference_images: list[str] | None = None, spatial_upsampler_param: float | None = None, spatial_upsampler_param2: float | None = None, film_grain_intensity: float = 0, film_grain_saturation: float = 0.5, seed: int = -1, api_options: dict[str, Any] | None = None, return_media: bool = False, callbacks: object | None = None, **settings_overrides: Any) -> SessionJob:
-        settings = build_media_postprocessing_settings(media_source, temporal_upsampling=temporal_upsampling, spatial_upsampling=spatial_upsampling, spatial_upsampler_prompt=spatial_upsampler_prompt, spatial_upsampler_reference_images=spatial_upsampler_reference_images, spatial_upsampler_param=spatial_upsampler_param, spatial_upsampler_param2=spatial_upsampler_param2, film_grain_intensity=film_grain_intensity, film_grain_saturation=film_grain_saturation, seed=seed, api_options=api_options, return_media=return_media, **settings_overrides)
+    def submit_media_postprocessing(self, media_source: str | os.PathLike[str], *, temporal_upsampling: str = "", spatial_upsampling: str = "", spatial_postprocessing_parameters: dict[str, Any] | None = None, temporal_postprocessing_parameters: dict[str, Any] | None = None, postprocessing_reference_images: list[Any] | None = None, film_grain_intensity: float = 0, film_grain_saturation: float = 0.5, seed: int = -1, api_options: dict[str, Any] | None = None, return_media: bool = False, callbacks: object | None = None, **settings_overrides: Any) -> SessionJob:
+        settings = build_media_postprocessing_settings(media_source, temporal_upsampling=temporal_upsampling, spatial_upsampling=spatial_upsampling, spatial_postprocessing_parameters=spatial_postprocessing_parameters, temporal_postprocessing_parameters=temporal_postprocessing_parameters, postprocessing_reference_images=postprocessing_reference_images, film_grain_intensity=film_grain_intensity, film_grain_saturation=film_grain_saturation, seed=seed, api_options=api_options, return_media=return_media, **settings_overrides)
         return self.submit_task(settings, callbacks=callbacks)
 
     def submit_audio_remux(self, video_source: str | os.PathLike[str], *, postprocess_audio: str, audio_source: str | os.PathLike[str] | None = None, postprocess_audio_prompt: str = "", postprocess_audio_neg_prompt: str = "", seed: int = -1, repeat_generation: int = 1, replace_voice_sample: str | os.PathLike[str] | None = None, replace_voice_sample2: str | os.PathLike[str] | None = None, api_options: dict[str, Any] | None = None, return_media: bool = False, callbacks: object | None = None, **settings_overrides: Any) -> SessionJob:
@@ -868,6 +904,16 @@ class WanGPSession:
     def _queue_lock(self):
         return self._ensure_runtime().module.lock if self._use_webui_queue else self._job_lock
 
+    def _workspace_gallery(self):
+        from shared.utils.workspace_storage import host_for_gen
+        from shared.utils.workspaces import load_gallery
+        gen = self._state['gen']
+        workspace_id = getattr(self, '_workspace_id', None)
+        host = host_for_gen(gen)
+        if workspace_id and host is not None and host.workspace_id != workspace_id:
+            return load_gallery(host.workspaces.get(workspace_id), host._workspace_settings)
+        return gen
+
     def list_queue(self) -> dict[str, Any]:
         """List all pending/running tasks in this session's generation queue, including UI tasks."""
         gen = self._state["gen"]
@@ -880,6 +926,7 @@ class WanGPSession:
                 cancelling = running and bool(gen.get("abort", False))
                 entries.append({
                     "queue_id": queue_id, "position": index + 1, "task_id": task.get("id"),
+                    **{key: task[key] for key in ('workspace_id', 'mcp_agent_id') if key in task},
                     "client_id": str(params.get("client_id", "") or ""),
                     "model_type": str(params.get("model_type", "") or ""),
                     "prompt": str(params.get("prompt", "") or "")[:320],
@@ -927,12 +974,7 @@ class WanGPSession:
             "gen": {
                 "queue": [],
                 "in_progress": False,
-                "file_list": [],
-                "file_settings_list": [],
-                "audio_file_list": [],
-                "audio_file_settings_list": [],
-                "selected": 0,
-                "audio_selected": 0,
+                **gallery_state_defaults(0),
                 "prompt_no": 0,
                 "prompts_max": 0,
                 "repeat_no": 0,
@@ -948,12 +990,21 @@ class WanGPSession:
 
     def _submit_tasks(self, tasks: list[dict[str, Any]], callbacks: object | None = None) -> SessionJob:
         with self._job_lock:
-            if self._active_job is not None and not self._active_job.done:
+            if not self._webui_concurrent and self._active_job is not None and not self._active_job.done:
                 raise RuntimeError("WanGP session already has a generation in progress")
             job = SessionJob(self)
             self._bind_callbacks_to_job(job, callbacks)
             prepared_tasks = copy.deepcopy(tasks)
-            client_ids = self._ensure_task_client_ids(prepared_tasks, priority=self._use_webui_queue)
+            from shared.utils.workspace_storage import capture_task
+            for task in prepared_tasks:
+                if getattr(self, '_workspace_id', None):
+                    task['workspace_id'] = self._workspace_id
+                if getattr(self, '_agent_context', None):
+                    task['mcp_agent_id'] = self._agent_context
+                capture_task(task, self._state)
+            if self._output_dir is not None and any(task.get('workspace_id') for task in prepared_tasks):
+                raise ValueError('An explicit output_dir cannot be combined with a workspace-bound queue. Use its original Workspaces Root.')
+            client_ids = self._ensure_task_client_ids(prepared_tasks, priority=self._use_webui_queue and not self._webui_append)
             if self._use_webui_queue:
                 prepared_tasks, manifest, load_queue_token = self._prepare_webui_bridge(prepared_tasks)
                 job._set_webui_bridge(manifest=manifest, client_ids=client_ids, load_queue_token=load_queue_token)
@@ -985,7 +1036,7 @@ class WanGPSession:
 
     @staticmethod
     def _ensure_task_client_ids(tasks: list[dict[str, Any]], *, priority: bool = False) -> tuple[str, ...]:
-        client_seed = time.time_ns()
+        client_seed = uuid.uuid4().hex[:16]  # unique across sessions and jobs submitted within one clock tick
         client_ids: list[str] = []
         for index, task in enumerate(tasks, start=1):
             params = copy.deepcopy(WanGPSession._get_task_settings(task))
@@ -1006,10 +1057,12 @@ class WanGPSession:
         manifest = []
         for index, task in enumerate(tasks, start=1):
             params = copy.deepcopy(self._get_task_settings(task))
-            params["priority"] = True
+            params["priority"] = not self._webui_append
             task["params"] = params
             manifest.append({
                 "id": task.get("id", index),
+                **({"workspace_id": task['workspace_id']} if task.get('workspace_id') else {}),
+                **({"mcp_agent_id": task['mcp_agent_id']} if task.get('mcp_agent_id') else {}),
                 "params": copy.deepcopy(params),
                 "plugin_data": copy.deepcopy(task.get("plugin_data", {})),
             })
@@ -1028,7 +1081,7 @@ class WanGPSession:
 
         run_webui_job(self, job, tasks)
 
-    def _build_progress_update(self, data: Any, *, include_state_fallback: bool = True) -> ProgressUpdate:
+    def _build_progress_update(self, data: Any, *, include_state_fallback: bool = True, task_id: str | None = None, task_index: int | None = None, task_count: int | None = None) -> ProgressUpdate:
         current_step: int | None = None
         total_steps: int | None = None
         status = ""
@@ -1086,6 +1139,11 @@ class WanGPSession:
             total_steps=total_steps,
             raw_phase=display_phase or None,
             unit=unit,
+            task_id=task_id,
+            task_index=task_index,
+            task_count=task_count,
+            window_index=(self._state["gen"].get("window_no") or None) if phase != "loading_model" else None,
+            window_count=(self._state["gen"].get("total_windows") or None) if phase != "loading_model" else None,
         )
 
     def _build_preview_update(self, wgp, tasks: list[dict[str, Any]], payload: Any) -> PreviewUpdate | None:
@@ -1128,13 +1186,16 @@ class WanGPSession:
             runtime.module.server_config["save_path"] = str(self._output_dir)
             runtime.module.server_config["image_save_path"] = str(self._output_dir)
             runtime.module.server_config["audio_save_path"] = str(self._output_dir)
+            runtime.module.server_config["mesh_save_path"] = str(self._output_dir)
             runtime.module.save_path = str(self._output_dir)
             runtime.module.image_save_path = str(self._output_dir)
             runtime.module.audio_save_path = str(self._output_dir)
+            runtime.module.mesh_save_path = str(self._output_dir)
         for output_path in (
             runtime.module.save_path,
             runtime.module.image_save_path,
             runtime.module.audio_save_path,
+            runtime.module.mesh_save_path,
         ):
             Path(output_path).mkdir(parents=True, exist_ok=True)
 
@@ -1168,11 +1229,13 @@ class WanGPSession:
         gen.pop("in_progress", None)
         self._ensure_runtime().module.gen_in_progress = False
 
-    def _collect_outputs(self, base_file_count: int, base_audio_count: int) -> list[str]:
+    def _gallery_counts(self) -> dict[str, int]:
         gen = self._state["gen"]
-        files = gen["file_list"][base_file_count:]
-        audio_files = gen["audio_file_list"][base_audio_count:]
-        return [str(Path(path).resolve()) for path in [*files, *audio_files]]
+        return {source.id: len(gen[source.files_key]) for source in GALLERY_SOURCES}
+
+    def _collect_outputs(self, base_counts: dict[str, int]) -> list[str]:
+        gen = self._state["gen"]
+        return [str(Path(path).resolve()) for source in GALLERY_SOURCES for path in gen[source.files_key][base_counts[source.id]:]]
 
     def _consume_output_artifact(self, client_id: str) -> GeneratedArtifact | None:
         gen = self._state["gen"]
@@ -1253,6 +1316,7 @@ class WanGPSession:
             runtime_settings_version = getattr(runtime.module, "settings_version", None)
             if runtime_settings_version is not None:
                 settings.setdefault("settings_version", runtime_settings_version)
+            runtime.module.convert_retired_model_type(settings)  # a model type merged into others (3D stage models + post-processors)
             model_type = str(settings.get("model_type", "") or "").strip()
             model_def = runtime.module.get_model_def(model_type) if model_type else None
             if isinstance(model_def, dict):
@@ -1486,7 +1550,7 @@ class WanGPSession:
         return min(90, 20 + int(ratio * 65))
 
 
-def build_media_postprocessing_settings(media_source: str | os.PathLike[str], *, temporal_upsampling: str = "", spatial_upsampling: str = "", spatial_upsampler_prompt: str = "", spatial_upsampler_reference_images: list[str] | None = None, spatial_upsampler_param: float | None = None, spatial_upsampler_param2: float | None = None, film_grain_intensity: float = 0, film_grain_saturation: float = 0.5, seed: int = -1, api_options: dict[str, Any] | None = None, return_media: bool = False, **settings_overrides: Any) -> dict[str, Any]:
+def build_media_postprocessing_settings(media_source: str | os.PathLike[str], *, temporal_upsampling: str = "", spatial_upsampling: str = "", spatial_postprocessing_parameters: dict[str, Any] | None = None, temporal_postprocessing_parameters: dict[str, Any] | None = None, postprocessing_reference_images: list[Any] | None = None, film_grain_intensity: float = 0, film_grain_saturation: float = 0.5, seed: int = -1, api_options: dict[str, Any] | None = None, return_media: bool = False, **settings_overrides: Any) -> dict[str, Any]:
     settings = {
         "mode": "edit_postprocessing",
         "prompt": "Media postprocessing",
@@ -1494,10 +1558,9 @@ def build_media_postprocessing_settings(media_source: str | os.PathLike[str], *,
         "video_source": os.fspath(media_source),
         "temporal_upsampling": temporal_upsampling or "",
         "spatial_upsampling": spatial_upsampling or "",
-        "spatial_upsampler_prompt": spatial_upsampler_prompt,
-        "spatial_upsampler_reference_images": list(spatial_upsampler_reference_images or []),
-        "spatial_upsampler_param": spatial_upsampler_param,
-        "spatial_upsampler_param2": spatial_upsampler_param2,
+        "spatial_postprocessing_parameters": dict(spatial_postprocessing_parameters or {}),
+        "temporal_postprocessing_parameters": dict(temporal_postprocessing_parameters or {}),
+        "postprocessing_reference_images": list(postprocessing_reference_images or []),
         "film_grain_intensity": film_grain_intensity,
         "film_grain_saturation": film_grain_saturation,
         "postprocess_audio": "",

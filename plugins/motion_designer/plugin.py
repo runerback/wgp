@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import base64
 import io
 import json
@@ -386,7 +387,6 @@ class MotionDesignerPlugin(WAN2GPPlugin):
                     c="copy",
                     r=frame_rate,
                     **{
-                        "vsync": "cfr",
                         "fps_mode": "cfr",
                         "fflags": "+genpts",
                         "copyts": None,

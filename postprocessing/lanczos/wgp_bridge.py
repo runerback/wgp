@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
 import numpy as np
@@ -56,6 +57,11 @@ class LanczosUpsampler(SimpleScaleSuffixMixin):
             "postprocessing_category": "upsampler",
             "description": "A very fast CPU resize with negligible VRAM use. It is sharper than a basic resize, but cannot reconstruct lost detail and may add ringing or aliasing.",
         }
+
+    def query_chunking(self, spatial_upsampling):
+        """How a long video goes through this upsampler a chunk at a time (postprocessing.chunking)."""
+        from postprocessing.chunking import FRAME_BY_FRAME
+        return FRAME_BY_FRAME
 
     def validate_upsampling(self, spatial_upsampling, image_mode: int) -> str:
         return ""

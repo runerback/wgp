@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from postprocessing import spatial_upsamplers as spatial_api
 from postprocessing import temporal_upsamplers as api
-from .runtime import dlssg_capabilities, frame_generate, is_rtx_50_series, release_flow_model, unavailable_reason
+from .runtime import DLSSG_LINUX, dlssg_capabilities, frame_generate, is_rtx_50_series, release_flow_model, unavailable_reason
 from .spatial_upsampler import DLSS5SpatialUpsampler
 
 
@@ -12,9 +12,27 @@ class DLSSGTemporalUpsampler(api.SimpleScaleSuffixMixin):
 
     def __init__(self, server_config=None, files_locator=None):
         self.server_config = server_config
+        if server_config is not None:
+            from .runtime import configure_depth_estimator
+            configure_depth_estimator(server_config)
 
     def config(self):
         return DLSS5SpatialUpsampler.normalize_config_section(spatial_api.read_config_section_by_key(self.server_config, "dlss5"))
+
+    def query_checkpoint_inventory(self):
+        from preprocessing.processors import query_preprocessor_download_def
+
+        return [{"name": "DLSS 5", "variant": "Frame Generation - RAFT Optical Flow", "download_defs": [query_preprocessor_download_def("flow")]}]
+
+    def query_download_defs(self, enabled_only=True):
+        from preprocessing.processors import query_preprocessor_download_def
+
+        return [query_preprocessor_download_def("flow", self.server_config)] if self.config()["motion_vector"] == "raft" else []
+
+    def download(self, process_files, *, send_cmd=None, status_text=None, gen=None, **_kwargs):
+        from shared.utils.download import process_files_def_if_needed
+
+        return process_files_def_if_needed(self.query_download_defs(), send_cmd=send_cmd, status_text=status_text or "Downloading DLSS Frame Generation Model Files", gen=gen, process_files=process_files)
 
     @property
     def status(self):
@@ -29,7 +47,7 @@ class DLSSGTemporalUpsampler(api.SimpleScaleSuffixMixin):
         capabilities = dlssg_capabilities() if not reason else {}
         worker_version = int(capabilities.get("worker_version", 0))
         maximum = int(capabilities.get("multi_frame_count_max", 1))
-        hardware_limit = 6 if is_rtx_50_series() else 4
+        hardware_limit = 2 if DLSSG_LINUX else (6 if is_rtx_50_series() else 4)
         multipliers = tuple(scale for scale in self.MULTIPLIERS if scale <= min(4, hardware_limit))
         if capabilities:
             multipliers = tuple(scale for scale in self.MULTIPLIERS if scale <= hardware_limit and scale - 1 <= maximum) if worker_version >= 2 else (2.0,)
@@ -46,8 +64,13 @@ class DLSSGTemporalUpsampler(api.SimpleScaleSuffixMixin):
             "methods": [(label, self.METHOD)],
             "multipliers": {self.METHOD: multipliers},
             "default_temporal_upsampling": "dlssg*2",
-            "description": "NVIDIA DLSS Frame Generation using video motion estimation. It provides x2-x4 interpolation and capability-gated x5/x6 on RTX 50 series. Requires Windows 11, HAGS, and GeForce RTX 40 or newer.",
+            "description": "NVIDIA DLSS Frame Generation using video motion estimation. Linux supports experimental x2 with the NVIDIA Vulkan driver and a compatible RTX GPU. Windows supports x2-x4 and capability-gated x5/x6 on RTX 50 series, and requires Windows 11, HAGS, and RTX 40 or newer.",
         }
+
+    def query_chunking(self, temporal_upsampling):
+        """How a long video goes through this upsampler a chunk at a time (postprocessing.chunking)."""
+        from postprocessing.system_upsampler_handler import DLSSG_HANDLER
+        return DLSSG_HANDLER
 
     def validate_upsampling(self, temporal_upsampling, *, source_is_image=False):
         split = self.split_value(temporal_upsampling)
@@ -55,6 +78,8 @@ class DLSSGTemporalUpsampler(api.SimpleScaleSuffixMixin):
             return f"Unknown DLSS Frame Generation mode: {temporal_upsampling}"
         if source_is_image:
             return "Temporal Upsampling can not be used with an Image"
+        if DLSSG_LINUX and split[1] != 2:
+            return "Linux DLSS Frame Generation currently supports x2 only."
         reason = unavailable_reason(temporal=True)
         if reason:
             return f"DLSS Frame Generation is unavailable: {reason}. See docs/DLSS5.md."

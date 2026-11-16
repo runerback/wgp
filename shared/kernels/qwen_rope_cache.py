@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """Qwen partial RoPE and paged cache writes with original rounding boundaries."""
 import torch
 import triton
@@ -5,14 +6,15 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 
-@triton.jit
+@triton.jit(do_not_specialize=("T", "QB", "QT", "QH", "KB", "KT", "KH", "VB", "VT", "VH", "CB", "CT"),
+            do_not_specialize_on_alignment=("T", "QB", "QT", "QH", "KB", "KT", "KH", "VB", "VT", "VH", "CB", "CT"))
 def _rope_cache_kernel(Q, K, V, COS, SIN, KC, VC, KS, VS, SLOTS,
-                       T: tl.constexpr, HQ: tl.constexpr, HK: tl.constexpr,
+                       T, HQ: tl.constexpr, HK: tl.constexpr,
                        D: tl.constexpr, R: tl.constexpr,
-                       QB: tl.constexpr, QT: tl.constexpr, QH: tl.constexpr,
-                       KB: tl.constexpr, KT: tl.constexpr, KH: tl.constexpr,
-                       VB: tl.constexpr, VT: tl.constexpr, VH: tl.constexpr,
-                       CB: tl.constexpr, CT: tl.constexpr,
+                       QB, QT, QH,
+                       KB, KT, KH,
+                       VB, VT, VH,
+                       CB, CT,
                        WRITE_CACHE: tl.constexpr, INT8: tl.constexpr):
     token, head = tl.program_id(0), tl.program_id(1)
     batch, time = token // T, token % T
@@ -59,8 +61,11 @@ def _rope_cache_kernel(Q, K, V, COS, SIN, KC, VC, KS, VS, SLOTS,
                     tl.store(VC + offset, v)
 
 
+from shared.kernels.dispatch import triton_dtype_supported  # after the kernels: their line numbers key Triton's cache
+
+
 def supported(q, k, v, cos, sin):
-    return (q.is_cuda and torch.version.hip is None and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    return (q.is_cuda and torch.version.hip is None and q.dtype in (torch.float16, torch.bfloat16, torch.float32) and triton_dtype_supported(q.device, q.dtype)
             and q.dtype == k.dtype == v.dtype == cos.dtype == sin.dtype
             and q.shape[:2] == k.shape[:2] == v.shape[:2] == cos.shape[:2]
             and q.shape[-1] == k.shape[-1] == v.shape[-1] and k.shape[2] == v.shape[2]
@@ -70,7 +75,9 @@ def supported(q, k, v, cos, sin):
 
 
 def apply_rope_cache(q, k, v, cos, sin, attention, slots):
-    write_cache = attention.k_cache.numel() > 0 and attention.v_cache.numel() > 0 and slots is not None
+    layout = getattr(attention, "kv_layout", None)
+    # the fused write knows the BF16 and Q8 caches; a mixed-precision body (kv_formats) is written by the attention's own store
+    write_cache = attention.k_cache.numel() > 0 and attention.v_cache.numel() > 0 and slots is not None and not (layout is not None and layout.mixed)
     _rope_cache_kernel[(q.shape[0] * q.shape[1], q.shape[2] + k.shape[2])](
         q, k, v, cos, sin, attention.k_cache, attention.v_cache, attention.k_scale, attention.v_scale, slots,
         q.shape[1], q.shape[2], k.shape[2], q.shape[3], cos.shape[-1],

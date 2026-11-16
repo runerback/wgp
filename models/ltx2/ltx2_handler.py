@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import os
 import shutil
 import sys
@@ -536,6 +537,7 @@ class family_handler:
         gemma_files = (_GEMMA4_FILENAME, _GEMMA4_INT8_FILENAME) if ltx25 else (_GEMMA_FILENAME, _GEMMA_QUANTO_FILENAME)
         extra_model_def = {
             "device_explicit": True,
+            "cuda_graphs": ["transformer", "transformer2"],
             "uint8_guides": ltx2_uint8_guides,
             "ltx2_22B_class": base_model_type in LTX2_22B_CLASS or ltx25,
             "ltx2_edit_anything": editanything_ref,
@@ -552,6 +554,8 @@ class family_handler:
             "frames_steps": 8,
             "sliding_window": not msr,
             "returns_audio": True,
+            "audio_window_alignment": True,
+            "audio_overlap_repair_ms": 80,  # reserve two 40 ms audio latents at the join
             "auto_null_audio": True,
             "multimedia_generation": True,
             "image_end_frame_position": True,
@@ -649,16 +653,17 @@ class family_handler:
             if ltx25 and not (msr or editanything_ref):
                 extra_model_def.update({"deepy_infos": LTX2_25_DEEPY_INFOS, "deepy_prompt_infos": LTX2_25_DEEPY_PROMPT_INFOS})
 
+            # AS / KS keep the soundtrack, as in H3; A or K alone, saved before, still do (fix_settings adds S); A1OF is a reference voice
             if msr:
-                audio_prompt_selection = ["", "A"]
+                audio_prompt_selection = ["", "AS"]
             elif editanything_ref and not distilled:
-                audio_prompt_selection = ["", "A", "K"]
+                audio_prompt_selection = ["", "AS", "KS"]
             else:
-                audio_prompt_selection = ["", "A", "K", "2", "A1OF"]
+                audio_prompt_selection = ["", "AS", "KS", "2", "A1OF"]
             audio_prompt_labels = {
                 "": "Generate Video & Soundtrack based on Text Prompt",
-                "A": "Generate Video based on Soundtrack and Text Prompt",
-                "K": "Generate Video based on Control Video + its Audio Track and Text Prompt",
+                "AS": "Generate Video based on Soundtrack and Text Prompt",
+                "KS": "Generate Video based on Control Video + its Audio Track and Text Prompt",
                 "2": "Generate Audio based on Control Video and Text Prompt",
                 "A1OF": "Generate Video based on Reference Voice (ID-LoRA) and Text Prompt",
             }
@@ -681,9 +686,9 @@ class family_handler:
                             "1": "Reference Voice (ID-LoRA)",
                             "2": "Generate Audio based on Control Video and Text Prompt",
                         },
-                        "letters_filter": "A1OFK2",
+                        "letters_filter": "A1OFKS2",
                         "show_label": False,
-                        "default": "K" if editanything_ref else "",
+                        "default": "KS" if editanything_ref else "",
                     },
                     "prompt_infos": LTX2_PROMPT_INFOS,
                     "prompt_enhancer_def": {
@@ -819,6 +824,9 @@ class family_handler:
             elif base_model_type in LTX2_22B_CLASS:
                 extra_model_def["sample_solvers"] = [("Distilled 8 Steps", "distilled_8_steps"), ("Euler", "euler"), ("HQ (res2s)", "res2s")]
         extra_model_def["guidance_max_phases"] = 2
+        extra_model_def["custom_sigmas"] = True
+        extra_model_def["custom_sigmas_switch_scale"] = None  # stages have independent schedules, no noise-switch control
+        extra_model_def["custom_sigmas_schedulers"] = ["", "euler", "res2s"]
         extra_model_def["visible_phases"] = 0 if distilled else 1
         if ltx25:
             extra_model_def["self_refiner"] = False
@@ -836,6 +844,11 @@ class family_handler:
         #     "scale": 1,
         #     }
 
+        from models.help_shared import merge_help
+        from .infos import compact_help
+        extra_model_def = merge_help(extra_model_def, compact_help(msr=msr, joy=joy, editanything=editanything_ref, ltx25=ltx25))
+        extra_model_def["infos"] += "\n\n**Custom Sigmas:** leave empty for the normal schedules. Separate values with commas and phase slots with `;`; a blank slot keeps that phase's defaults. Explicit schedules override its step count. The **i** beside the field explains the syntax. Fixed eight-step schedulers require this field to stay empty."
+        extra_model_def["deepy_infos"] += " `custom_sigmas` defaults to empty; use comma-separated positive descending values below 1 and one semicolon-separated slot per phase, e.g. `;0.9,0.6,0.3`. Blank slots retain defaults; optional final zero is ignored. Explicit sigmas are used directly without another flow shift and determine that phase's step count. Each phase restarts its own schedule. Compatible selectable schedulers: `euler`, `res2s`; fixed `distilled_8_steps` / `distilled_8_steps_ancestral` require empty custom sigmas."
         extra_model_def["phase_2_spatial_tiling"] = not (msr or joy or editanything_ref)
         if extra_model_def["phase_2_spatial_tiling"]:
             tiling_help = "\n\n**Two Phases with Tiling** refines overlapping spatial tiles in phase 2, blending predictions at every step. Phase 1 establishes the whole scene. This reduces each transformer call's spatial extent, takes more calls, and can change fine detail. VAE tiling is independent."
@@ -844,6 +857,10 @@ class family_handler:
                     extra_model_def[key] += tiling_help
         from .vfx import vfx_model_def
         extra_model_def.update(vfx_model_def(model_def))
+        if ltx25:
+            extra_model_def["resolution_budget"] = "1920x1088"
+            if extra_model_def["phase_2_spatial_tiling"]:
+                extra_model_def["resolution_budget_tiled"] = "3840x2176"
         return extra_model_def
 
     @staticmethod
@@ -860,6 +877,12 @@ class family_handler:
     @staticmethod
     def get_lora_dir(base_model_type):
         return "ltx2"
+
+    @staticmethod
+    def query_retired_files(model_type):
+        """Checkpoints that earlier releases of a model type downloaded and its current definition no longer names (Models Manager
+        lists them with the model, to delete them)."""
+        return {"ltx2_19B": ["ltx-2-19b-ic-lora-canny-control.safetensors", "ltx-2-19b-ic-lora-depth-control.safetensors", "ltx-2-19b-ic-lora-pose-control.safetensors"]}.get(model_type, [])
 
     @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
@@ -1159,11 +1182,14 @@ class family_handler:
         if settings_version < 2.58 and pipeline_kind == "distilled":
             ui_defaults["guidance_phases"]=2
 
-        if settings_version < 2.65: 
+        if settings_version < 2.65:
             audio_prompt_type = ui_defaults.get("audio_prompt_type", None)
             if audio_prompt_type is not None and "L" in audio_prompt_type:
                 audio_prompt_type =audio_prompt_type.replace("L", "")
                 ui_defaults["audio_prompt_type"] = audio_prompt_type
+        audio_prompt_type = ui_defaults.get("audio_prompt_type", "") or ""
+        if any(letter in audio_prompt_type for letter in "AK") and not any(letter in audio_prompt_type for letter in "S1O"):
+            ui_defaults["audio_prompt_type"] = audio_prompt_type + "S"  # a kept soundtrack was A or K alone before AS / KS; A1OF (a reference voice) stays
 
             
     @staticmethod
@@ -1188,7 +1214,7 @@ class family_handler:
         if _is_editanything_model(model_def):
             ui_defaults.update(
                 {
-                    "audio_prompt_type": "K",
+                    "audio_prompt_type": "KS",
                     "video_prompt_type": "VGI",
                     "remove_background_images_ref": 1,
                 }

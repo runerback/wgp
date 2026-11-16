@@ -14,6 +14,7 @@ from accelerate import init_empty_weights
 from safetensors.torch import load_file
 from shared.utils import files_locator as fl
 from shared.utils.phase_progress import generation_progress
+from shared.cuda_memory import mmgp_vram_allocator
 from shared.utils.hdr import VIDEO_PROMPT_HDR_OUTPUT_FLAG, hdr_linear_to_vae_range, sdr_to_vae_range
 
 from .ltx_core.conditioning import AudioConditionByLatent, AudioConditionByLatentPrefix, AudioConditionByReferenceLatent
@@ -351,8 +352,8 @@ class LTX2SuperModel(torch.nn.Module):
         object.__setattr__(self, "_ltx2", ltx2_model)
 
         transformer = ltx2_model.model
-        velocity_model = getattr(transformer, "velocity_model", transformer)
-        self.velocity_model = velocity_model
+        # MMGP registers LoRA slots on the X0Model, not its inner velocity model.
+        self.model = transformer
         split_map = getattr(transformer, "split_linear_modules_map", None)
         if split_map is not None:
             self.split_linear_modules_map = split_map
@@ -396,6 +397,8 @@ class _LTX2VAEHelper:
         output_height: int | None = None,
         output_width: int | None = None,
     ) -> int | tuple[int, int]:
+        if mmgp_vram_allocator():  # no allocator fragmentation to guard against: Default and Low VRAM levels
+            return 256 if vae_config == 3 or device_mem_capacity < 8000 else 512
         if vae_config >= 4:
             vae_config = 0
 
@@ -479,7 +482,7 @@ def _attach_lora_preprocessor(transformer: torch.nn.Module) -> None:
             if module_name.startswith("feature_extractor_linear."):
                 module_name = f"text_embedding_projection.{module_name[len('feature_extractor_linear.') :]}"
             if module_name not in module_names:
-                prefixed_name = f"velocity_model.{module_name}"
+                prefixed_name = f"model.{module_name}" if module_name.startswith("velocity_model.") else f"model.velocity_model.{module_name}"
                 if module_name.endswith(".to_out") and f"{prefixed_name}.0" in module_names:
                     module_name = f"{prefixed_name}.0"
                 elif prefixed_name in module_names:
@@ -1393,6 +1396,7 @@ class LTX2:
         audio_cfg_scale: float | None = None,
         alt_scale: float = 0.0,
         sample_solver: str = "",
+        custom_sigmas=None,
         NAG_scale: float = 1.0,
         NAG_tau: float = 3.5,
         NAG_alpha: float = 0.5,
@@ -1406,6 +1410,7 @@ class LTX2:
         input_ref_images=None,
         input_waveform=None,
         input_waveform_sample_rate=None,
+        audio_conditioning_end=None,
         audio_scale: float | None = None,
         outpainting_dims: list[int] | None = None,
         frame_num: int = 121,
@@ -1447,7 +1452,7 @@ class LTX2:
             alpha_source = input_frames
             height, width = input_frames.shape[-2:]
             if max(height, width) > 1920 or min(height, width) > 1088:
-                raise ValueError("Alpha Gen supports source videos up to 1920×1088. Resize the source before loading it.")
+                raise ValueError("Alpha Gen supports source videos up to 1920Ã—1088. Resize the source before loading it.")
             frame_num = min(frame_num, input_frames.shape[1])
             input_prompt = ""
             guide_phases = 1
@@ -1781,6 +1786,11 @@ class LTX2:
                         4,
                     )
                     audio_latent = audio_latent.to(device=self.device, dtype=self.dtype)
+                    if audio_conditioning_end is not None and "1" not in audio_prompt_type:
+                        # Keep the reliable prefix fixed; the remaining target tokens retain their noise.
+                        token_seconds = self.audio_encoder.mel_hop_length * audio_downsample / self.audio_encoder.sample_rate
+                        prefix_tokens = max(0, math.floor(audio_conditioning_end / token_seconds + 1e-9))
+                        audio_latent = audio_latent[:, :, :prefix_tokens, :]
                     if "1" in audio_prompt_type:
                         audio_conditionings = [AudioConditionByReferenceLatent(audio_latent)]
                         audio_conditionings_stage2 = []
@@ -1801,7 +1811,9 @@ class LTX2:
                             audio_latent_downsample_factor=audio_downsample,
                         )
                         target_frames = target_shape.frames
-                        if audio_latent.shape[2] < target_frames:
+                        if audio_latent.shape[2] == 0:
+                            audio_conditionings = None
+                        elif audio_latent.shape[2] < target_frames:
                             audio_conditionings = [AudioConditionByLatentPrefix(audio_latent)]
                         else:
                             if audio_latent.shape[2] > target_frames:
@@ -1854,12 +1866,13 @@ class LTX2:
         ltx2_22B_class = self.model_def.get("ltx2_22B_class", False)
 
         def run_ltx2_pipeline(**pipeline_kwargs):
+            pipeline_kwargs["custom_sigmas"] = custom_sigmas
             pipeline_context = self.pipeline.joyai_echo_context(joyai_context) if joyai_context is not None else nullcontext()
             with pipeline_context:
                 return self.pipeline(**pipeline_kwargs)
 
         if hdr_transform == "acescct":
-            pipeline_output = convert_sdr_to_hdr(self.model, self.video_encoder, self.video_decoder, self.pipeline.pipeline_components, self.device, input_frames, prefix_frames_count if images else 0, images, hdr_scene_context[0], int(frame_num), target_height, target_width, float(fps), int(seed), tiling_config=tiling_config, loras_slists=loras_slists, callback=callback, set_progress_status=set_progress_status, interrupt_check=interrupt_check), None
+            pipeline_output = convert_sdr_to_hdr(self.model, self.video_encoder, self.video_decoder, self.pipeline.pipeline_components, self.device, input_frames, prefix_frames_count if images else 0, images, hdr_scene_context[0], int(frame_num), target_height, target_width, float(fps), int(seed), tiling_config=tiling_config, loras_slists=loras_slists, callback=callback, set_progress_status=set_progress_status, interrupt_check=interrupt_check, custom_sigmas=custom_sigmas), None
         elif isinstance(self.pipeline, TI2VidTwoStagesPipeline):
             pipeline_output = run_ltx2_pipeline(
                 prompt=input_prompt,

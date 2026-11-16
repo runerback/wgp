@@ -1,9 +1,11 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
 import time
 
 from shared.utils.plugins import WAN2GPPlugin
 
+from .deepy_toolbox import MediaFlowAgent
 from .plugin_ui import create_config_ui as _create_config_ui
 
 PlugIn_Name = "Media Flow"
@@ -24,6 +26,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
         self.request_component("refresh_form_trigger")
         self.request_component("output_trigger")
         self.add_tab(tab_id=PlugIn_Id, label=PlugIn_Name, component_constructor=self.create_config_ui)
+        MediaFlowAgent(self).register()  # the same processes for agents: MCP, Deepy and Deepy Python (wangp_plugins)
 
     def on_tab_select(self, state: dict) -> str:
         return str(time.time_ns())

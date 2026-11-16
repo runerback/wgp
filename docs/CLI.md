@@ -130,18 +130,22 @@ Queue completed: 3/3 tasks in 5m 23s
 
 ```bash
 --mcp                              # Start WanGP as an MCP server without the web UI
---mcp-transport TRANSPORT          # stdio, sse, or streamable-http
+--mcp-webui                        # Override Agents config: enable MCP with the web UI
+--no-mcp-webui                     # Override Agents config: disable MCP with the web UI
+--mcp-transport TRANSPORT          # stdio (default with --mcp), sse, or streamable-http (default with the web UI)
 --mcp-host HOST                    # Host for HTTP transports
---mcp-port PORT                    # Port for HTTP transports
---mcp-api-version {1,2}            # WanGP API contract; latest (2) by default, 1 for compatibility
---mcp-async                        # Permit wait=false in v2; disabled by default
+--mcp-port PORT                    # Override Configuration > Agents port for HTTP transports (default: 8000)
+--mcp-api-version {1,2,2.1}        # WanGP API contract; latest (2.1) by default
+--mcp-async                        # Permit wait=false in v2/v2.1; disabled by default
 --mcp-console-output               # Mirror WanGP output while serving MCP
 --mcp-allow-read-file-system       # Allow agents to submit arbitrary server file paths (disabled by default)
 ```
 
-Media IDs returned by the Gallery remain usable when filesystem reads are disabled. Streamable HTTP and SSE servers also expose short-lived Gallery upload/download URLs; stdio does not provide HTTP media transfer.
+MCP is off by default with the web UI, including after upgrading. Control autostart with **Enable MCP with Web UI** under **Configuration > Agents**. When enabled, agents' generations join the queue shown in the browser, run after the tasks already waiting and appear in every open page's progress and preview; their outputs go to the agent's workspace without switching the gallery you are viewing. In this mode asynchronous calls are always available. Set **MCP Server Port** under **Configuration > Agents** and restart, or override it for one launch with `--mcp-port PORT`. `--mcp-webui` and `--no-mcp-webui` override the saved autostart choice for one launch without changing it. See [MCP server inside the web UI](API.md#mcp-server-inside-the-web-ui).
 
-The default MCP interface is now v2. Existing clients that use historical tool names or parameters must launch with `python wgp.py --mcp --mcp-api-version 1`. Use `--mcp-api-version 2` to pin v2 explicitly. Both `--mcp-api-version` and `--mcp-async` also work with `python -m shared.mcp_server`. The number selects the WanGP tool API, not the MCP protocol version; unsupported numbers are rejected. API v1 retains its original wait behavior. In v2, generation and post-processing wait by default; `--mcp-async` enables optional asynchronous calls without changing that default. See [API migration](API.md#mcp-api-v2-and-migration).
+Media IDs returned by the Gallery remain usable when unrestricted filesystem reads are disabled. V2.1 also provides output-folder reads and a writable session workspace. Streamable HTTP and SSE servers expose short-lived file and Gallery upload/download URLs; stdio downloads use binary MCP resources with byte-range support.
+
+The default MCP interface is v2.1, with `remux_media`, native visual inspection, file delivery and searchable documentation. Existing clients can pin an earlier contract with `--mcp-api-version 1` or `--mcp-api-version 2`. Both `--mcp-api-version` and `--mcp-async` also work with `python -m shared.mcp`. The number selects the WanGP tool API, not the MCP protocol version; unsupported versions are rejected. API v1 retains its original wait behavior. In v2/v2.1, generation and post-processing wait by default; `--mcp-async` enables optional asynchronous calls without changing that default. See [v2.1 additions](API.md#mcp-api-v21-additions) and [API migration](API.md#mcp-api-v2-and-migration).
 
 ### Examples
 ```bash
@@ -185,7 +189,7 @@ Each materialized session keeps its canonical decoder context in `context.json` 
 --quantize-transformer BOOL   # Enable/disable transformer quantization (default: True)
 --compile                     # Enable PyTorch compilation (requires Triton)
 --attention MODE              # Force attention mode: sdpa, flash, sage, sage2
---profile NUMBER              # Performance profile 1-5 (default: 4)
+--profile NUMBER              # Performance profile 0-5 (default: 4)
 --preload NUMBER              # Preload N MB of diffusion model in VRAM (Manual VRAM Preload for every kind of output)
 --fp16                        # Force fp16 instead of bf16 models
 --save-quantized              # Save an INT8 Quanto checkpoint during model loading
@@ -194,21 +198,22 @@ Each materialized session keeps its canonical decoder context in `context.json` 
 ```
 
 ### Performance Profiles
+- **Profile 0**: like Profile 4, models are sent to the GPU part by part, but no model keeps Reserved RAM for good: the parts of the model running are kept in Reserved RAM while it runs, then the RAM goes to the next model. Close to the speed of the profiles that keep models in Reserved RAM, with much less RAM. By default it also keeps in VRAM as much of each model as the generation leaves free, like Profile 3 (*VRAM Preload* below; choose *Manual* to set a fixed amount instead). The language models of Deepy and the prompt enhancer always run this way, with *Dynamic* preload, whatever the memory profile of your model, and get the CPU's help when they write (see *Language Models CPU Compute*)
 - **Profile 1**: each model loaded whole in VRAM, all models kept in Reserved RAM. The fastest generations and model switches, needs the most RAM and VRAM
 - **Profile 2**: all models kept in Reserved RAM, sent to the GPU part by part. Runs models larger than your VRAM, leaves VRAM for long videos or large images and switches models fast, needs a lot of RAM
 - **Profile 3**: each model loaded whole in VRAM, only the main models kept in Reserved RAM. Fast generations with less RAM, needs enough VRAM for the whole model
-- **Profile 3+** (3.5, recommended for audio models): Profile 3 without any Reserved RAM. Audio models are usually small enough to fit whole in VRAM, where the language models many of them include run much faster and can use the faster CUDA Graph or vLLM engines; models load more slowly
+- **Profile 3+** (3.5, recommended for audio models): Profile 3 without any Reserved RAM. Audio models are usually small enough to fit whole in VRAM, where the language models many of them include run fastest (they use CUDA Graphs with every profile, also when sent to the GPU part by part); models load more slowly
 - **Profile 4** (recommended): only the main models kept in Reserved RAM, sent to the GPU part by part. The most versatile: runs models larger than your VRAM and leaves VRAM for long videos or large images
 - **Profile 4+** (4.5): Profile 4 sending one part at a time. Saves up to about 1 GB of VRAM, slightly slower
 - **Profile 5** (fail safe): almost no Reserved RAM, all models sent to the GPU part by part. For PCs short of RAM and VRAM, slower with short steps such as images
 
 ### Preloading Part of the Model in VRAM
-With profiles 2, 4 and 5, models are transferred to the GPU block by block at every denoising step. Image models such as Flux have short steps, so with profile 4 these transfers, rather than the GPU computation, can set the speed. In *Configuration / RAM/VRAM Management*, a *VRAM Preload* choice next to the default memory profile of each kind of output (video, image and audio) decides how much of each model stays in VRAM, so that less is transferred at each step:
-- *Default*: the memory profile's own choice.
+With profiles 0, 2, 4 and 5, models are transferred to the GPU block by block at every denoising step. Image models such as Flux have short steps, so with profile 4 these transfers, rather than the GPU computation, can set the speed. In *Configuration / RAM/VRAM Management*, a *VRAM Preload* choice next to the default memory profile of each kind of output (video, image and audio) decides how much of each model stays in VRAM, so that less is transferred at each step:
+- *Default*: the memory profile's own choice (*Dynamic* for profile 0, none for profiles 2, 4 and 5).
 - *Dynamic*: as much of each model as the generation leaves free, adapted as it goes (below).
-- *Manual*: the amount set with the *VRAM Preload (MB)* slider shown below it, spread across the blocks of each model.
+- *Manual*: the amount set with the *VRAM Preload (MB)* slider shown below it, spread across the blocks of each model. Models that work side by side and stay in VRAM together (a world model and its video decoder, the two stages of some audio models) share that amount instead of getting it each, the main model first: for example 12000 MB with a world model of 8.4 GB and a decoder of 7 GB keeps the world model whole and 3.6 GB of the decoder, 12 GB in all. Some models keep more in VRAM on their own (for instance the language models of audio models, which stay whole): the preload never gives a model less than that. Models made of many experts (Nemotron 3.5 Transcribe, Fish Audio) give what the preload leaves beyond such a model to their experts, which then run on the GPU instead of the processor. If the generation needs more VRAM than the preload leaves free, just enough of the preloaded parts leave the VRAM (also when the preload holds the whole model) until the model is loaded again, instead of the generation spilling into RAM and slowing down several times.
 
-The choice is hidden for profiles 1, 3 and 3+, which load models entirely in VRAM. A memory profile chosen in the settings of a generation uses the VRAM Preload of its kind of output, and `--preload` sets a manual value for all three.
+The choice is hidden for profiles 1, 3 and 3+, which always keep as much of each model in VRAM as fits. A memory profile chosen in the settings of a generation uses the VRAM Preload of its kind of output, and `--preload` sets a manual value for all three.
 
 For Flux dev at 1024x1024, a manual 6000 MB shortened the profile 4 steps by about 22%, to within about 20% of profile 1, with about half of its peak VRAM. Preloading uses VRAM during denoising only: at this resolution it did not raise the peak VRAM, which the image decoding sets.
 
@@ -229,6 +234,18 @@ For Flux dev at 1024x1024, a manual 6000 MB shortened the profile 4 steps by abo
 Pinned ("reserved") RAM makes the transfers to the GPU fast, but nothing else can use it. *Configuration / RAM/VRAM Management / Reserved RAM for Pinning* sets the share of RAM that WanGP may pin, in percent (0 = automatic: 40% on Windows, 60% on Linux). `--perc-reserved-mem-max` takes precedence over this setting, which takes precedence over the `perc_reserved_mem_max` environment variable.
 
 When the models do not all fit in it, WanGP reserves first the parts used at every step; with [Smart Memory Pinning](#smart-memory-pinning), the rest still reaches the GPU almost as fast, so a smaller share mostly costs speed on short steps.
+
+### Trying a Smaller GPU
+```bash
+--max-vram 8   # WanGP behaves as on a GPU with 8 GB of VRAM
+```
+`--max-vram GB` makes WanGP behave as it would on a GPU with that much VRAM: memory profiles, preloads, VAE tiling and Deepy's choices follow that card, and WanGP uses at most GB - 1.2 GB of VRAM (a real card leaves about that much to the driver and the desktop). Use it to check that settings or a workflow fit a smaller GPU before sharing them. The VRAM other programs use on your GPU does not count, unless they leave less than the emulated card would: then WanGP has only what is really free. The speed stays that of your GPU.
+
+### RAM Budget
+```bash
+--max-ram 24   # WanGP plans its RAM within 24 GB
+```
+`--max-ram GB` gives WanGP a RAM budget, to leave room for the other programs you use beside it: the RAM it reserves for fast transfers, the RAM it keeps free and the moment it gives back the RAM of models that are not running all follow that budget, counting the RAM WanGP already uses. The RAM other programs use does not count, unless they leave WanGP less than its budget. The RAM WanGP may reserve stays a share of your PC's real RAM (see `--perc-reserved-mem-max`), a safeguard that keeps your system responsive, and never exceeds the budget. It guides WanGP's memory planning but is not a hard limit: a generation that needs more RAM than the budget still gets it from your PC.
 
 ### VRAM Allocator
 ```bash
@@ -264,11 +281,19 @@ The setting applies when WanGP starts; `--ram-allocator` takes precedence over i
 ```
 On Windows, WanGP asks by default to keep its full CPU speed when its window is minimized or in the background. Windows may otherwise slow down a background application several times, which slows down generation on the steps where the GPU waits for the CPU. On a laptop running on battery, `--no-prevent-power-throttling` saves power at the cost of slower generations while WanGP is in the background.
 
+You can also change **Configuration / Performance / Prevent Windows Background Power Throttling**, then save and restart the server. It applies to the server process and all browser sessions, without raising process priority. Explicit `--prevent-power-throttling` or `--no-prevent-power-throttling` launch options override the saved choice. This is separate from **Continue Browser Actions in Background**, which lets pending interface actions and updates continue while the tab is in the background. Already-started generation queues run on the server and continue even when all browser tabs are closed, regardless of this browser option.
+
+### Compute Cache
+*Configuration / Performance / WanGP Compute Cache* (off by default, shown with RTX 50xx and other NVIDIA Blackwell GPUs). With these GPUs, PyTorch and the other GPU libraries ship their code in a form that the NVIDIA driver optimizes for the exact GPU each time WanGP starts, which costs about 10-15 seconds at the first generation. The driver keeps the result in a cache shared by every program and limited to 1 GB, where models push out one another's code and other programs trim it, so the work is done again after restarts and rewritten on the disk at each launch. Older GPUs run the shipped code as is and do not need this option.
+
+The option keeps this cache in a folder of its own: `ComputeCache` in the WanGP folder, or the *Compute Cache Folder* you choose (relative to the WanGP folder, or a full path). The code of each model is completed over its first few launches (the driver optimizes a limited amount per launch). After that, the first generation after a restart starts sooner, and nothing more is written to the disk at launch, which spares the SSD. It may take up to 2 GB of disk space. The setting applies when WanGP starts.
+
 ### Smart Memory Pinning
 *Configuration / RAM/VRAM Management / Smart Memory Pinning* (On by default) speeds up the models that the memory profile does not keep in Reserved RAM: the text encoders with Profile 4, every model with Profile 5, and the part of a model that does not fit when *Reserved RAM for Pinning* is low. With it, they reach the GPU almost as fast as the models kept in Reserved RAM, for about 1-2 GB of Reserved RAM.
 
 - It helps most with Profile 5, with image models and other generations made of short steps (low resolutions, the first pass of distilled models), and on PCs with little RAM to reserve. With long steps (high resolutions, long videos), the difference is small.
 - Off: these models reach the GPU more slowly, and the 1-2 GB of Reserved RAM stay free for other programs.
+- Profile 0 always uses it, with a larger share: the parts of the model running that do not fit in VRAM use the *Reserved RAM for Pinning* left by the other models, released when you switch models or when your PC runs short of RAM.
 - Changing this option reloads the model.
 
 ## Lora Configuration
@@ -321,9 +346,12 @@ JSON entries take precedence over `--loras`. Unlisted keys use the root from `--
 ```bash
 --settings PATH              # Path to folder containing default settings for all models
 --config PATH                # Config folder for wgp_config.json and queue.zip
---workspaces-dir FOLDER       # Gallery workspaces for Gradio/Web (default: ./workspaces)
+--workspaces-dir FOLDER       # Workspace manifests/media; overrides Config / Outputs (default: ./workspaces)
+--offline                    # Never download: use only the files already on this computer
 --verbose LEVEL              # Information level 0-2 (default: 1)
 ```
+
+With `--offline`, WanGP and the libraries it uses never download anything: models, text encoders, LoRAs from links and processing tools must already be in your checkpoints folders. A missing file stops the job with an error naming it, instead of starting a download. Useful on a computer without internet access, on a metered connection, or to make sure a test or a batch runs only with the files you already have.
 
 ## Examples
 

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
 import json
@@ -252,7 +253,7 @@ class CodexBackend:
             method = str(payload.get("method", "") or "")
             params = dict(payload.get("params", {}) or {})
             if method == "item/tool/call" and "id" in payload:
-                self._handle_tool_request(payload["id"], params)
+                threading.Thread(target=self._handle_tool_request, args=(payload["id"], params), name="wangp-codex-tool", daemon=True).start()  # this loop keeps reading: Stop gets its answer during a long tool
             elif method == "account/login/completed" and (not self._login_id or str(params.get("loginId", "") or "") == self._login_id):
                 self._login_id = ""
                 self._login_url = ""

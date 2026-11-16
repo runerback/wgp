@@ -1,4 +1,7 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import ast
+import ctypes
+import functools
 import os
 import re
 import struct
@@ -9,13 +12,17 @@ from enum import IntEnum
 from typing import List, Optional
 
 import torch
+from torch._subclasses.fake_tensor import is_fake
 from torch.utils import _pytree as pytree
 
 from optimum.quanto import QModuleMixin, register_qmodule
 from optimum.quanto.tensor.qtensor import QTensor
 from optimum.quanto.tensor.qtype import qtype as _quanto_qtype, qtypes as _quanto_qtypes
 from collections import OrderedDict
+from tqdm import tqdm
+from mmgp import allocator as _allocator, cuda_graphs as _cuda_graphs
 from mmgp.offload import QEmbedding as BaseQEmbedding
+from shared.kernels.triton_tuner import LaunchTuner
 
 
 HANDLER_NAME = "gguf"
@@ -26,12 +33,24 @@ class PrismQuantizationType(IntEnum):
     PTQ1_0 = 143
 
 
+class GgmlExtraQuantizationType(IntEnum):
+    """ggml types newer than the released gguf package."""
+    Q2_0 = 42
+
+
+_EXTRA_QUANTIZATION_SIZES = {GgmlExtraQuantizationType.Q2_0: (64, 18)}
+
+
 def _quantization_type(value):
-    return PrismQuantizationType(value) if value == 143 else gguf.GGMLQuantizationType(value)
+    if value == 143:
+        return PrismQuantizationType(value)
+    return GgmlExtraQuantizationType(value) if value in _EXTRA_QUANTIZATION_SIZES else gguf.GGMLQuantizationType(value)
 
 
 def _quantization_sizes(value):
-    return (128, 28) if value == PrismQuantizationType.PTQ1_0 else gguf.GGML_QUANT_SIZES[value]
+    if value == PrismQuantizationType.PTQ1_0:
+        return 128, 28
+    return _EXTRA_QUANTIZATION_SIZES[value] if value in _EXTRA_QUANTIZATION_SIZES else gguf.GGML_QUANT_SIZES[value]
 
 try:
     import gguf
@@ -182,9 +201,10 @@ def _validate_gguf_cuda_module(module):
     raw_weight = torch.from_numpy(quantized_weight).contiguous().cuda()
     input_tensor = torch.linspace(-0.5, 0.5, 64, dtype=torch.float32, device="cuda").reshape(2, 32)
     fast_out = module.linear(raw_weight, "Q4_0", [1, 32], input_tensor, None, torch.float32)
-    dense_weight = torch.from_numpy(gguf.quants.dequantize(quantized_weight, gguf.GGMLQuantizationType.Q4_0)).to(device=input_tensor.device, dtype=torch.float32)
-    ref_out = torch.nn.functional.linear(input_tensor, dense_weight, None)
-    torch.cuda.synchronize()
+    dense_weight = torch.from_numpy(gguf.quants.dequantize(quantized_weight, gguf.GGMLQuantizationType.Q4_0)).to(dtype=torch.float32)
+    # On the CPU: on the GPU, cuBLAS would keep a workspace for this thread and stream.
+    ref_out = torch.nn.functional.linear(input_tensor.cpu(), dense_weight, None)
+    fast_out = fast_out.cpu()
     if fast_out.shape != ref_out.shape:
         raise RuntimeError(f"Q4 self-test shape mismatch: {tuple(fast_out.shape)} vs {tuple(ref_out.shape)}")
     if not torch.allclose(fast_out, ref_out, atol=2e-2, rtol=2e-2):
@@ -205,7 +225,7 @@ def _probe_gguf_cuda_runtime(force=False):
     except Exception as exc:
         _GGUF_CUDA_KERNELS_ENABLED_CACHE = False
         _GGUF_CUDA_MODULE = None
-        _GGUF_CUDA_LOAD_ERROR = exc
+        _GGUF_CUDA_LOAD_ERROR = f"{type(exc).__name__}: {exc}"  # not the exception: its traceback would keep the callers' frames (the models being loaded) alive
         _gguf_log_once("gguf_cuda_probe_failed", f"[GGUF][llama.cpp CUDA] kernels unavailable, using fallback")
         return False
     _GGUF_CUDA_KERNELS_ENABLED_CACHE = True
@@ -521,6 +541,12 @@ def get_file_metadata(file_path):
     result = (state_dict, metadata)
     _GGUF_METADATA_CACHE[cache_key] = (OrderedDict(result[0]), dict(result[1]))
     return OrderedDict(result[0]), dict(result[1])
+
+
+def cpu_compute_supported(tensor):
+    """Whether linears with this weight compute on the CPU in its storage when MMGP leaves their block there (cpuCompute)."""
+    from shared.kernels import cpu_linear
+    return isinstance(tensor, GGUFWeightTensor) and cpu_linear.supported(tensor)
 
 
 def _filter_state_dict_basic(state_dict, base_model_prefix, keep_prefix=False):
@@ -841,6 +867,108 @@ def _gguf_qtype_name(qtype_obj):
     return getattr(qtype_obj, "name", None) or str(qtype_obj)
 
 
+_LLAMACPP_SLICE_BYTES = 64 << 20  # scratch of one slice of rows: q8_1 input and FP32 product (the row loop's Q8 ring stays within it)
+GGUF_CUDA_CHUNKING = True  # native row loop (GGUF 1.0.27+) where a one-time timing on this GPU shows it beats the slices
+
+# Switching implementations must select a fresh graph instead of replaying the old one.
+_cuda_graphs.register_key(lambda: GGUF_CUDA_CHUNKING)
+_ROW_LOOP_TUNER = LaunchTuner("gguf_row_loop", 1, "GGUF")
+
+
+def _typed_mmq(module, target_dtype):
+    """Whether the package's MMQ writes target_dtype itself (GGUF 1.0.28+: BF16, no FP32 product nor conversion pass)."""
+    typed = getattr(module, "_wangp_typed_mmq", None)
+    if typed is None:
+        typed = module._wangp_typed_mmq = callable(getattr(module, "has_typed_mmq", None)) and bool(module.has_typed_mmq())
+    return typed and target_dtype == torch.bfloat16
+
+
+def _mmq_product_bytes(module, target_dtype):
+    return 2 if _typed_mmq(module, target_dtype) else 4
+
+
+def _sliced_cuda_linear(module, raw, qtype_name, shape, x, bias, target_dtype, step):
+    # Legacy MMQ needs a Q8 input copy and a product the size of the output (FP32, or the output type when the kernels write it):
+    # bound that scratch with 128-row-aligned slices.
+    product_dtype = target_dtype if _typed_mmq(module, target_dtype) else torch.float32
+    out = torch.empty((x.shape[0], shape[0]), dtype=target_dtype, device=x.device)
+    for start in range(0, x.shape[0], step):
+        out[start:start + step].copy_(module.linear(raw, qtype_name, shape, x[start:start + step], None, product_dtype))
+    if bias is not None:
+        out.add_(bias.to(out.device, out.dtype))
+    return out
+
+
+def _row_loop_selected(module, raw, qtype_name, shape, x, bias, target_dtype, step, scratch):
+    # One cooperative launch per linear (one CUDA graph node, no FP32 product) where the GPU and shape are structurally supported,
+    # unless the slices measured faster on this GPU. The winner depends on the row count (few long tiles favour the slices' stream-K):
+    # timed once per power-of-two range of rows, on the leading rows (read only, capped), cached across sessions.
+    if not (GGUF_CUDA_CHUNKING and hasattr(module, "linear_chunked") and x.dtype == target_dtype and x.is_contiguous()
+            and module.linear_chunked_supported(qtype_name, shape, target_dtype, bias is not None, x.device.index)):
+        return False
+    rows = min(x.shape[0], max(4 * step, 16384))
+    tuned = []
+
+    def prepare_scratch():
+        tuned.append(True)
+        sample = x[:rows]
+
+        def launch(config):
+            if config[0] == "row_loop":
+                module.linear_chunked(raw, qtype_name, shape, sample, bias, target_dtype, scratch)
+            else:
+                _sliced_cuda_linear(module, raw, qtype_name, shape, sample, bias, target_dtype, step)
+        return launch
+
+    bucket = 1 << (rows.bit_length() - 1)
+    identity = f"{module.__version__}|{qtype_name}|{shape[1]}->{shape[0]}|{str(target_dtype)[6:]}|bias={bias is not None}|rows>={bucket}"
+    with _allocator.normal_allocations():  # timing outputs must not grow a CUDA graph's pool
+        choice = _ROW_LOOP_TUNER.config("linear", identity, x.device, (("row_loop",), ("slices",)), prepare_scratch, True)[0]
+    if tuned:
+        tqdm.write(f"[GGUF][llama.cpp CUDA] {qtype_name} {shape[1]}->{shape[0]} linear, {bucket}+ rows: {choice.replace('_', ' ')} selected after timing on this GPU.")
+    return choice == "row_loop"
+
+
+def _llamacpp_cuda_linear(module, raw, qtype_name, shape, input_tensor, bias, target_dtype):
+    input_tensor = input_tensor.contiguous()
+    out_features, in_features = shape
+    rows = input_tensor.numel() // in_features
+    product_bytes = _mmq_product_bytes(module, target_dtype)
+    step = max(128, _LLAMACPP_SLICE_BYTES // (product_bytes * out_features + in_features * 9 // 8) // 128 * 128)
+    if rows < 2 * step or module._linear_mode() != "mmq":
+        return module.linear(raw, qtype_name, shape, input_tensor, bias, target_dtype)
+    step = -(-rows // (-(-rows // step) * 128)) * 128  # slices of even size
+    # The row loop's Q8 ring stays one 2 MiB allocator page below a slice (here at least 32 MiB): its peak is never above the slices'.
+    scratch = step * (product_bytes * out_features + in_features * 9 // 8) - (2 << 20)
+    x = input_tensor.reshape(rows, in_features)
+    if _row_loop_selected(module, raw, qtype_name, shape, x, bias, target_dtype, step, scratch):
+        out = module.linear_chunked(raw, qtype_name, shape, x, bias, target_dtype, scratch)
+    else:
+        out = _sliced_cuda_linear(module, raw, qtype_name, shape, x, bias, target_dtype, step)
+    return out.reshape(*input_tensor.shape[:-1], out_features)
+
+
+_OVERREAD_QTYPES = ("Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "IQ4_NL")  # blocks of 32 values
+_OVERREAD_ROWS = 2 if torch.version.hip else 9  # input rows from which the batched kernel serves these formats (CUDA: beyond the short-batch kernels)
+
+
+def _linear_many_rows_narrow(module, weight_tensor, raw, qtype_name, shape, input_tensor, bias, target_dtype):
+    """llamacpp_gguf_cuda up to 1.0.29: the batched kernel walks a weight row by 256 values, so for a format of 32-value blocks whose width is not a multiple of 256 it reads past the end
+    of the last rows, and the memory beside the weight decides whether the last output features are finite (or whether the read faults). Those features (one for a width of 224 or more)
+    are computed from their decoded weights here; the short-batch kernels are not concerned. Later packages serve these weights themselves (has_bounded_batched_reads)."""
+    rows, columns = shape
+    values, size = _quantization_sizes(weight_tensor._tensor_type)
+    blocks = columns // values
+    apart = min(rows, -(-(8 - blocks % 8) // blocks))
+    raw = raw.reshape(rows, -1)
+    last = _DEQUANTIZE_FUNCTIONS[_quantization_type(weight_tensor._tensor_type)](raw[rows - apart:].reshape(-1, size), values, size, torch.float32).reshape(apart, columns)
+    tail = torch.nn.functional.linear(input_tensor.float(), last, None if bias is None else bias[rows - apart:].float()).to(target_dtype)
+    if rows == apart:
+        return tail
+    head = _llamacpp_cuda_linear(module, raw[:rows - apart], qtype_name, (rows - apart, columns), input_tensor, None if bias is None else bias[:rows - apart], target_dtype)
+    return torch.cat((head, tail.to(head.dtype)), -1)
+
+
 def _try_llamacpp_cuda_linear(weight_tensor, input_tensor, bias, target_dtype):
     if not _gguf_cuda_kernels_enabled():
         return None
@@ -850,17 +978,23 @@ def _try_llamacpp_cuda_linear(weight_tensor, input_tensor, bias, target_dtype):
     if not torch.is_tensor(raw) or raw.device.type != "cuda" or not raw.is_contiguous():
         return None
     qtype_name = _gguf_qtype_name(getattr(weight_tensor, "_tensor_type", None))
-    try:
-        gguf_llamacpp_cuda = _gguf_cuda_module()
-        if gguf_llamacpp_cuda is None or not gguf_llamacpp_cuda.may_support_linear_qtype_name(qtype_name):
-            return None
-        fast_out = gguf_llamacpp_cuda.linear(raw, qtype_name, tuple(getattr(weight_tensor, "_tensor_shape", weight_tensor.shape)), input_tensor, bias, target_dtype)
-        if fast_out is not None:
-            _gguf_log_once(f"llamacpp_cuda_linear_active_{qtype_name}", f"[GGUF][llama.cpp CUDA] linear fast path active for {qtype_name}.")
-        return fast_out
-    except Exception as exc:
-        _gguf_log_once(f"llamacpp_cuda_linear_{qtype_name}", f"[GGUF][llama.cpp CUDA] linear GGUF CUDA kernels failed for {qtype_name}, using fallback: {exc}")
+    gguf_llamacpp_cuda = _gguf_cuda_module()
+    if gguf_llamacpp_cuda is None or not gguf_llamacpp_cuda.may_support_linear_qtype_name(qtype_name):
         return None
+    shape = tuple(getattr(weight_tensor, "_tensor_shape", weight_tensor.shape))
+    # Restored orig_shape rows can cross GGUF blocks. MMQ requires whole blocks
+    # per row; the fused tile decoder addresses the original flattened stream.
+    if shape[1] % _quantization_sizes(weight_tensor._tensor_type)[0] and gguf_llamacpp_cuda._linear_mode() == "mmq":
+        select_kernel = getattr(gguf_llamacpp_cuda, 'packed_row_kernel', None)
+        flat_linear = None if select_kernel is None else select_kernel(qtype_name, input_tensor.device.index, target_dtype)
+        if flat_linear is None:
+            return None
+        return flat_linear(input_tensor, raw, list(shape), qtype_name, _maybe_cast_bias(bias, target_dtype), target_dtype)
+    if qtype_name in _OVERREAD_QTYPES and shape[1] % 256 and input_tensor.numel() // shape[1] >= _OVERREAD_ROWS and not hasattr(gguf_llamacpp_cuda, "has_bounded_batched_reads"):
+        return _linear_many_rows_narrow(gguf_llamacpp_cuda, weight_tensor, raw, qtype_name, shape, input_tensor, bias, target_dtype)
+    fast_out = _llamacpp_cuda_linear(gguf_llamacpp_cuda, raw, qtype_name, shape, input_tensor, bias, target_dtype)
+    _gguf_log_once(f"llamacpp_cuda_linear_active_{qtype_name}", f"[GGUF][llama.cpp CUDA] linear fast path active for {qtype_name}.")
+    return fast_out
 
 
 def _try_llamacpp_cuda_embedding(weight_tensor, index_tensor, target_dtype):
@@ -872,17 +1006,12 @@ def _try_llamacpp_cuda_embedding(weight_tensor, index_tensor, target_dtype):
     if not torch.is_tensor(raw) or raw.device.type != "cuda" or not raw.is_contiguous():
         return None
     qtype_name = _gguf_qtype_name(getattr(weight_tensor, "_tensor_type", None))
-    try:
-        gguf_llamacpp_cuda = _gguf_cuda_module()
-        if gguf_llamacpp_cuda is None or not gguf_llamacpp_cuda.may_support_embedding_qtype_name(qtype_name):
-            return None
-        fast_out = gguf_llamacpp_cuda.embedding(raw, qtype_name, tuple(getattr(weight_tensor, "_tensor_shape", weight_tensor.shape)), index_tensor, target_dtype)
-        if fast_out is not None:
-            _gguf_log_once(f"llamacpp_cuda_embedding_active_{qtype_name}", f"[GGUF][llama.cpp CUDA] embedding fast path active for {qtype_name}.")
-        return fast_out
-    except Exception as exc:
-        _gguf_log_once(f"llamacpp_cuda_embedding_{qtype_name}", f"[GGUF][llama.cpp CUDA] embedding GGUF CUDA kernels failed for {qtype_name}, using fallback: {exc}")
+    gguf_llamacpp_cuda = _gguf_cuda_module()
+    if gguf_llamacpp_cuda is None or not gguf_llamacpp_cuda.may_support_embedding_qtype_name(qtype_name):
         return None
+    fast_out = gguf_llamacpp_cuda.embedding(raw, qtype_name, tuple(getattr(weight_tensor, "_tensor_shape", weight_tensor.shape)), index_tensor, target_dtype)
+    _gguf_log_once(f"llamacpp_cuda_embedding_active_{qtype_name}", f"[GGUF][llama.cpp CUDA] embedding fast path active for {qtype_name}.")
+    return fast_out
 
 
 def _may_try_llamacpp_cuda_linear(weight_tensor, input_tensor):
@@ -1323,10 +1452,18 @@ def _dequantize_blocks_IQ4_XS(blocks, block_size, type_size, dtype=None):
     return (dl * _iq4_values(qs).reshape(n, 8, 32)).reshape(n, block_size).to(dtype)
 
 
+def _dequantize_blocks_Q2_0(blocks, block_size, type_size, dtype=None):
+    n = blocks.shape[0]
+    d, qs = _split_block_dims(blocks, 2)
+    codes = (qs.unsqueeze(-1) >> (torch.arange(4, device=blocks.device, dtype=torch.uint8) * 2)) & 3
+    return (d.view(torch.float16).float() * (codes.reshape(n, block_size).float() - 1)).to(dtype)
+
+
 if gguf is not None:
     _IQ4_VALUES = torch.tensor(gguf.quants.IQ4_NL.kvalues, device="cpu", dtype=torch.float32)
     _DEQUANTIZE_FUNCTIONS = {
         PrismQuantizationType.PTQ1_0: _dequantize_blocks_PTQ1_0,
+        GgmlExtraQuantizationType.Q2_0: _dequantize_blocks_Q2_0,
         gguf.GGMLQuantizationType.Q8_0: _dequantize_blocks_Q8_0,
         gguf.GGMLQuantizationType.Q5_1: _dequantize_blocks_Q5_1,
         gguf.GGMLQuantizationType.Q5_0: _dequantize_blocks_Q5_0,
@@ -1442,12 +1579,20 @@ class GGUFWeightTensor(QTensor):
 
         if raw_rows.device != input.device:
             raw_rows = raw_rows.to(input.device)
-        dense_rows = _gguf_dequantize_tensor(
-            raw_rows,
-            self._tensor_type,
-            (flat_input.numel(), embedding_dim),
-            dtype=dtype,
-        )
+        kernels = None
+        if raw_rows.is_cuda and dtype in (torch.float32, torch.bfloat16):
+            from shared.kernels import expert_gguf_groups as kernels
+            if not kernels.decode_rows_supported(raw_rows.device, _quantization_type(self._tensor_type)):
+                kernels = None
+        if kernels is not None:
+            dense_rows = kernels.decode_rows(raw_rows, _quantization_type(self._tensor_type), flat_input.numel(), embedding_dim, dtype)
+        else:
+            dense_rows = _gguf_dequantize_tensor(
+                raw_rows,
+                self._tensor_type,
+                (flat_input.numel(), embedding_dim),
+                dtype=dtype,
+            )
         del raw_rows
         if dense_rows.device != input.device:
             dense_rows = dense_rows.to(input.device)
@@ -1461,6 +1606,9 @@ class GGUFWeightTensor(QTensor):
         else:
             target_dtype = _resolve_default_dtype(self._gguf_default_dtype, fallback=self.dtype)
             target_device = self.device
+        if self._data.device.type == "cpu" and getattr(self, "_mm_cpu_compute", False):  # a block that MMGP leaves on the CPU (cpuCompute)
+            from shared.kernels import cpu_linear
+            return cpu_linear.linear(self, input, bias, target_dtype)
         if self._tensor_type == PrismQuantizationType.PTQ1_0 and target_device.type == "cuda":
             from .prism import ptq_linear
             return ptq_linear(input, self._data, list(self._tensor_shape), bias, target_dtype)
@@ -1598,6 +1746,40 @@ class GGUFWeightTensor(QTensor):
         return _gguf_qfallback(op, *args, **(kwargs or {}))
 
 
+class _GGUFRowProjection:
+    @staticmethod
+    def supports(module, x):
+        weight = getattr(module, "weight", None)
+        return (isinstance(weight, GGUFWeightTensor) and not is_fake(x) and len(weight._tensor_shape) == 2
+                and weight.shape[1] % _quantization_sizes(weight._tensor_type)[0] == 0
+                and not (getattr(module, "_use_optimized_kernels", False) and x.shape[0] <= 8)
+                and not (getattr(module, "_prism_decode_enabled", False) and x.shape[0] == 1))
+
+    @staticmethod
+    def key(module):
+        transform = getattr(module, "prism_transform", None)
+        return ("prism_rows", transform) if transform is not None else None
+
+    @staticmethod
+    def prepare(module, x):
+        return module.prism_transform(x)
+
+    @staticmethod
+    def rows(module, x, start, stop):
+        source = module.weight
+        k = source.shape[1]
+        raw = source._data.reshape(source.shape[0], -1)[start:stop].reshape(-1)
+        weight = GGUFWeightTensor.create(raw, (stop - start, k), (k, 1), source.dtype,
+                                         tensor_type=source._tensor_type, tensor_shape=(stop - start, k))
+        return weight.linear(x, None if module.bias is None else module.bias[start:stop])
+
+
+from mmgp import offload
+
+_GGUF_ROW_PROJECTION = _GGUFRowProjection()
+offload.register_row_projection(_GGUF_ROW_PROJECTION)
+
+
 class GGUFFirstRowsLinear(torch.nn.Module):
     """Zero-copy linear view over a contiguous prefix of GGUF weight rows."""
 
@@ -1627,6 +1809,67 @@ class GGUFFirstRowsLinear(torch.nn.Module):
             object.__setattr__(self, "_cached_raw", source_raw)
             object.__setattr__(self, "_cached_weight", weight)
         return self._cached_weight.linear(input)
+
+
+_DRAFT_HEAD_GROUPS, _DRAFT_HEAD_KEEP = 256, 4  # the rows scored exactly at each draft: the 4 best of each of 256 groups of the head's one-bit copy
+_DRAFT_HEAD_FLOOR = -30000.0  # the logit of the other rows: no probability, and finite under every rule applied to logits
+_DRAFT_HEAD_DISABLED = "draft_candidates" in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the whole head at each draft, to compare
+
+
+def draft_candidates_supported(source: torch.nn.Module, row_count: int) -> bool:
+    """GGUFCandidateRowsLinear serves this head: the GGUF kernel package has its selection kernel for this GPU and the head's shape fits it."""
+    module = _gguf_cuda_module() if _gguf_cuda_kernels_enabled() and torch.cuda.is_available() else None
+    weight = getattr(source, "weight", None)
+    if _DRAFT_HEAD_DISABLED or module is None or not hasattr(module, "head_group_bits") or not module.has_head_candidates(torch.cuda.current_device()) or not isinstance(weight, GGUFWeightTensor):
+        return False
+    columns = int(weight._tensor_shape[1])
+    return row_count % _DRAFT_HEAD_GROUPS == 0 and _DRAFT_HEAD_KEEP <= row_count // _DRAFT_HEAD_GROUPS <= 1024 and columns % 128 == 0 and columns <= 8192
+
+
+class GGUFCandidateRowsLinear(GGUFFirstRowsLinear):
+    """A drafter's head over the first rows of a GGUF head, in two stages. A draft needs the head's few best tokens, and the head reads
+    its whole vocabulary for them at every draft (Qwen3.8 27B: 98,304 rows of Q6_K, 412 MB, 247 us on an RTX 5090). Here a one-bit copy
+    of those rows (their signs and a scale per row, 61 MB, dealt once into groups by a fixed shuffle) gives the 4 best rows of each of 256
+    groups, and the head's own kernel scores those 1,024 rows exactly: 69 us in all. The other tokens get a logit that leaves them no
+    probability. On 6,000 inputs of the drafter's head in real passes its best token is among the rows scored in 99.9 % of the cases, and
+    the tokens left out hold 0.1 % of its probability at a temperature of 0.6 (0.4 % at 1);
+    a token missed is a draft less likely to be accepted, never a different output: the verification does not depend on the drafts."""
+
+    def __init__(self, source: torch.nn.Module, row_count: int):
+        super().__init__(source, row_count)
+        weight = source.weight
+        values, size = _quantization_sizes(weight._tensor_type)
+        full_rows, columns = map(int, weight._tensor_shape)
+        raw = weight._data.reshape(full_rows, -1)
+        dequantize, module = _DEQUANTIZE_FUNCTIONS[_quantization_type(weight._tensor_type)], _gguf_cuda_module()
+        device = torch.device("cuda")  # built on the GPU by chunks of rows (about 100 MB at a time), kept as buffers that MMGP places with the model
+        bits, scales = [], []
+        for start in range(0, self.row_count, 1024):
+            dense = dequantize(raw[start:min(start + 1024, self.row_count)].to(device).reshape(-1, size), values, size, torch.float32).reshape(-1, columns)
+            chunk_bits, chunk_scale = module.head_sign_bits(dense)
+            bits.append(chunk_bits.cpu())
+            scales.append(chunk_scale.cpu())
+        shuffle = torch.randperm(self.row_count, generator=torch.Generator(device="cpu").manual_seed(0), device="cpu")
+        self.register_buffer("candidate_bits", module.head_group_bits(torch.cat(bits)[shuffle], _DRAFT_HEAD_GROUPS), persistent=False)  # by group and by part of a row: read as contiguous runs
+        self.register_buffer("candidate_scale", torch.cat(scales)[shuffle].contiguous().view(torch.int32), persistent=False)  # float32 kept as its bits: no dtype conversion touches it
+        self.register_buffer("candidate_ids", shuffle.to(torch.int32), persistent=False)
+        # the candidates' quantized rows, gathered at each draft: one buffer for every graph that drafts, instead of a temporary in each graph's own memory
+        self.register_buffer("candidate_rows", torch.empty((_DRAFT_HEAD_GROUPS * _DRAFT_HEAD_KEEP, raw.shape[1]), dtype=torch.uint8), persistent=False)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        source_weight, bits, gathered = self.weight, self.candidate_bits, self.candidate_rows
+        source_raw = source_weight._data
+        if not (input.is_cuda and bits.device == input.device and gathered.device == input.device and source_raw.device == input.device and input.numel() == input.shape[-1] and input.dtype in (torch.float16, torch.bfloat16, torch.float32)):
+            return super().forward(input)  # several rows at once, or weights not placed with the input: the whole head
+        module = _gguf_cuda_module()
+        full_rows, in_features = map(int, source_weight._tensor_shape)
+        count = _DRAFT_HEAD_GROUPS * _DRAFT_HEAD_KEEP
+        index = module.head_candidates(input, bits, self.candidate_scale.view(torch.float32), self.candidate_ids, _DRAFT_HEAD_GROUPS, _DRAFT_HEAD_KEEP)[0].long()
+        rows = GGUFWeightTensor.create(torch.index_select(source_raw.reshape(full_rows, -1), 0, index, out=gathered), (count, in_features), (in_features, 1), source_weight.dtype, tensor_type=source_weight._tensor_type, tensor_shape=(count, in_features))
+        exact = rows.linear(input)
+        _gguf_log_once("draft_candidates", f"[GGUF][llama.cpp CUDA] draft head: {count} candidate rows of {self.row_count} scored at each draft (one-bit copy of the head, {bits.numel() * 4 >> 20} MB).")
+        logits = torch.full((*input.shape[:-1], self.row_count), _DRAFT_HEAD_FLOOR, dtype=exact.dtype, device=exact.device)
+        return logits.scatter_(-1, index.view(*([1] * (input.dim() - 1)), -1), exact)
 
 
 @torch.library.custom_op("wangp_gguf::linear_fused", mutates_args=())
@@ -1707,14 +1950,15 @@ class QLinearGGUF(QModuleMixin, torch.nn.Linear):
         # Decode and short speculative batches (up to 8 rows): typed outputs and
         # fused SiLU-multiply avoid separate conversion and activation kernels
         # (bit-identical results). Prefill keeps the established kernels.
-        if optimized and input.numel() <= 8 * input.shape[-1] and input.is_cuda and torch.version.hip is None and isinstance(qweight, GGUFWeightTensor):
+        if optimized and input.numel() <= 8 * input.shape[-1] and input.is_cuda and torch.version.hip is None and isinstance(qweight, GGUFWeightTensor) and qweight._data.is_cuda:
             native = _gguf_cuda_module()
             supports = getattr(native, "supports_linear_fusions", None)
-            if callable(supports) and supports(qweight._tensor_type.name, input.numel() // input.shape[-1], input.device.index):
+            if (callable(supports) and qweight.shape[1] % _quantization_sizes(qweight._tensor_type)[0] == 0
+                    and supports(qweight._tensor_type.name, input.numel() // input.shape[-1], input.device.index)):
                 dtype = _resolve_default_dtype(qweight._gguf_default_dtype, fallback=input.dtype)
                 return linear_fused(input, qweight._data, qweight._tensor_type.name, list(qweight._tensor_shape), self.bias, dtype, silu_mul)
         if silu_mul:
-            from shared.llm_engines.nanovllm.layers.activation import silu_mul as apply_silu_mul
+            from shared.llm_engines.lmgp.layers.activation import silu_mul as apply_silu_mul
             input = apply_silu_mul(input, use_triton=optimized)
         if isinstance(qweight, GGUFWeightTensor):
             return qweight.linear(input, bias=self.bias)
@@ -2025,6 +2269,13 @@ class QEmbedding(BaseQEmbedding):
                 self.sparse,
             )
             return self._apply_embed_scale(output)
+        if (isinstance(qweight, QTensor) and getattr(qweight, "_data", None) is not None and qweight._data.dim() == 2
+                and tuple(qweight._scale.shape) == (qweight._data.shape[0], 1) and self.max_norm is None):
+            # Quanto per-row table: dequantize the looked-up rows only, as its dequantization does (scale * data), not the whole table
+            # (a 248K-token INT8 vocabulary is 2 GB in BF16 per call)
+            data = qweight._data[input]
+            output = qweight._scale[input] * (data.to(qweight._scale.dtype) if qweight.qtype.is_floating_point else data)
+            return self._apply_embed_scale(output)
         return super().forward(input)
 
     def _load_from_state_dict(
@@ -2096,7 +2347,22 @@ def convert_to_quanto(state_dict, default_dtype, verboseLevel=1, detection=None)
     return {"state_dict": state_dict, "quant_map": quant_map}
 
 
+def _prepare_runtime_buffers(device):
+    # Packages before 1.0.12 have no explicit runtime buffers: they allocate their scratch lazily.
+    module = _gguf_cuda_module()
+    if hasattr(module, "prepare_runtime_buffers"):
+        module.prepare_runtime_buffers(device)
+
+
+def _release_runtime_buffers():
+    if hasattr(_GGUF_CUDA_MODULE, "release_runtime_buffers"):
+        _GGUF_CUDA_MODULE.release_runtime_buffers()
+
+
 def apply_pre_quantization(model, state_dict, quantization_map, default_dtype=None, verboseLevel=1):
+    if model is not None and any(info.get("weights") == _GGUF_QTYPE_NAME for info in (quantization_map or {}).values()):
+        from mmgp import runtime
+        runtime.register_resource(model, _prepare_runtime_buffers, _release_runtime_buffers)
     if default_dtype is None or model is None or not quantization_map:
         return quantization_map or {}, []
     _set_default_dtype_from_loader(default_dtype)
@@ -2105,3 +2371,109 @@ def apply_pre_quantization(model, state_dict, quantization_map, default_dtype=No
         if name in quantized and isinstance(module, torch.nn.Linear):
             module._router_default_dtype = default_dtype
     return quantization_map or {}, []
+
+
+# ----------------------------------------------------------------------------------------------------------------------------------------
+# Routed experts in GGUF storage: rows of ggml blocks, per expert, in the checkpoint's own tensors
+
+
+from mmgp.expert_compute import ExpertFormat
+
+
+class GgufExperts(ExpertFormat):
+    """gate_exps and up_exps: uint8 [experts, intermediate, row bytes] rows of hidden values, down_exps: uint8 [experts, hidden, row bytes] rows of
+    intermediate values, in the ggml block format of each tensor (a bank's blocks: the three ggml types, read from the row widths). The CPU kernels
+    run in place (shared.kernels.cpu_linear), the GPU kernels read the same rows (shared.kernels.expert_gguf_triton)."""
+    name = "gguf"
+    reports_usage = True
+    _TYPES = tuple(int(gguf.GGMLQuantizationType[name]) for name in ("IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "IQ4_NL")) + (int(GgmlExtraQuantizationType.Q2_0),) if gguf is not None else ()
+
+    @staticmethod
+    def _width(type, columns):
+        values, size = _quantization_sizes(_quantization_type(type))
+        return columns // values * size
+
+    def tensors(self, experts, hidden, intermediate, gated=True, blocks=None):
+        gate, up, down = blocks or (int(gguf.GGMLQuantizationType.IQ3_S), int(gguf.GGMLQuantizationType.IQ3_S), int(gguf.GGMLQuantizationType.IQ4_NL))
+        return {"gate_exps": ((experts, intermediate, self._width(gate, hidden)), torch.uint8), "up_exps": ((experts, intermediate, self._width(up, hidden)), torch.uint8),
+                "down_exps": ((experts, hidden, self._width(down, intermediate)), torch.uint8)}
+
+    def matches(self, tensors):
+        return all(tensor.dtype == torch.uint8 for tensor in tensors.values())
+
+    def blocks(self, hidden, intermediate, tensors):
+        def type_of(tensor, columns):
+            for type in self._TYPES:
+                if columns % _quantization_sizes(_quantization_type(type))[0] == 0 and self._width(type, columns) == tensor.shape[-1]:
+                    return type
+            raise ValueError(f"No GGUF expert format has rows of {tensor.shape[-1]} bytes for {columns} columns")
+        return type_of(tensors["gate_exps"], hidden), type_of(tensors["up_exps"], hidden), type_of(tensors["down_exps"], intermediate)
+
+    def _addresses(self, bank):
+        return [getattr(bank, name).data_ptr() for name in bank.expert_tensor_names]
+
+    def cpu_job(self, bank, payload, resident, out, tokens, topk, threads, share=None, share_rows=0):
+        from shared.kernels import cpu_linear
+        gate, up, down = self._addresses(bank)
+        job = cpu_linear.MoeJob(gate=gate, up=up, down=down, payload=payload, resident=resident, usage=bank.usage.data_ptr(), out=out, gate_type=bank.blocks[0], up_type=bank.blocks[1], down_type=bank.blocks[2],
+                                tokens=tokens, h=bank.hidden, i=bank.intermediate, experts=bank.num_experts, topk=topk, threads=threads, tail_rank=bank.tail_rank if tokens <= bank.TAIL_WINDOW else 0, status=0,
+                                share=None if share is None else ctypes.pointer(share), share_rows=share_rows)
+        return job, cpu_linear.moe_host_function()
+
+    def cpu_share(self, fields):
+        from shared.kernels import cpu_linear
+        if not cpu_linear.moe_share_supported():
+            return None
+        share = cpu_linear.MoeShare()
+        for name, value in fields.items():
+            if name == "offsets":
+                share.offsets[:] = value
+            else:
+                setattr(share, name, value)
+        return share
+
+    def share_ring(self, slot_bytes, slots, device):
+        from shared.kernels import cpu_linear
+        return cpu_linear.ShareRing(slot_bytes, slots, device)
+
+    def share_sections(self):
+        from shared.kernels import cpu_linear
+        return cpu_linear.REMOTE_COPIES
+
+    def cpu_forward(self, bank, x, ids, probabilities, resident, out, tokens, topk, threads):
+        from shared.kernels import cpu_linear
+        return cpu_linear.moe_forward(*self._addresses(bank), bank.blocks, x, ids, probabilities, resident, out, tokens, bank.hidden, bank.intermediate, bank.num_experts, topk, threads)
+
+    def doorbell(self, device):
+        from shared.kernels import cpu_linear, host_doorbell
+        return (host_doorbell, cpu_linear.moe_server_function()) if host_doorbell.supported(device) else None
+
+    def gpu_forward(self, bank, x, ids, probabilities, pointers, out=None, mid=None):
+        from shared.kernels import expert_gguf_triton
+        return expert_gguf_triton.forward(x, ids, probabilities, pointers, bank.intermediate, bank.blocks, out=out, mid=mid)
+
+    def gpu_pass_supported(self, device):
+        from shared.kernels import expert_gguf_groups
+        return expert_gguf_groups.supported(device)
+
+    def pass_shares(self):
+        from shared.kernels import kernel_policy
+        return kernel_policy.allow_approximate()
+
+    def gpu_pass(self, bank, x, host_ids, probabilities, order, zero=False):
+        from shared.kernels import expert_gguf_groups
+        return expert_gguf_groups.prompt_pass(x, host_ids, probabilities, bank.intermediate, bank.blocks, order, zero)
+
+    @staticmethod
+    def _matrix(raw, type, rows, columns):
+        type = _quantization_type(type)
+        values, size = _quantization_sizes(type)
+        return _DEQUANTIZE_FUNCTIONS[type](raw.reshape(-1, size), values, size, torch.float32).reshape(rows, columns)
+
+    def dequantize(self, bank, tensors):
+        gate = self._matrix(tensors["gate_exps"], bank.blocks[0], bank.intermediate, bank.hidden)
+        up = self._matrix(tensors["up_exps"], bank.blocks[1], bank.intermediate, bank.hidden)
+        return torch.cat((gate, up)), self._matrix(tensors["down_exps"], bank.blocks[2], bank.hidden, bank.intermediate)
+
+
+EXPERT_FORMATS = (GgufExperts(),) if gguf is not None else ()
