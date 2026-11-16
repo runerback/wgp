@@ -7,7 +7,7 @@ import torch
 from accelerate import init_empty_weights
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import logging
-from mmgp import offload
+from mmgp import offload, runtime
 from shared.utils import files_locator as fl
 from shared.utils.gguf_mapping import has_standard_gguf_tensor_names, remap_state_dict_triplet
 from transformers import AutoConfig, AutoTokenizer, Qwen3ForCausalLM
@@ -143,7 +143,9 @@ class model_factory:
 
         model_class = ZImageTransformer2DModel
 
-        kwargs_light= { "writable_tensors": False, "default_dtype": torch.bfloat16, "preprocess_sd": preprocess_sd, "fused_split_map": _ZIMAGE_FUSED_SPLIT_MAP }
+        # the loader converts the unquantized weights to dtype and gives it to the quantized formats as their compute dtype, without
+        # dequantizing them (a transformer.to(dtype) would)
+        kwargs_light= { "writable_tensors": False, "default_dtype": dtype, "preprocess_sd": preprocess_sd, "fused_split_map": _ZIMAGE_FUSED_SPLIT_MAP }
         # model_filename contains all files to load (transformer + modules merged by loader)
         import json
         import accelerate
@@ -164,8 +166,6 @@ class model_factory:
 
         from wgp import save_model
         from mmgp.safetensors2 import torch_load_file
-
-        transformer.to(dtype)
 
         if module_source is not None:
             save_model(transformer, model_type, dtype, None, is_module=True, filter=list(torch_load_file(fl.locate_file(module_source))), module_source_no=1)
@@ -197,6 +197,10 @@ class model_factory:
             defaultConfigPath=text_encoder_config,
             preprocess_sd=_build_qwen3_state_dict_preprocessor(text_encoder_config),
         )
+        # the token table stays in RAM (mmgp looks up the prompt's rows on the CPU) with the output head tied to it, which never runs:
+        # the hidden states come from the base model
+        runtime.lookup_on_cpu(text_encoder.model.embed_tokens)
+        runtime.unused(text_encoder.lm_head)
 
         # Tokenizer
         tokenizer = AutoTokenizer.from_pretrained(text_encoder_path, trust_remote_code=True)
@@ -236,6 +240,7 @@ class model_factory:
         n_prompt: str | None = None,
         sampling_steps: int = 20,
         sample_solver: str = "default",
+        shift: float = None,
         width: int = 1024,
         height: int = 1024,
         guide_scale: float = 0.0,
@@ -283,6 +288,12 @@ class model_factory:
         if self.model_def.get("guidance_max_phases", 0) < 1:
             guide_scale = 0
 
+        # without the Shift setting the scheduler keeps the shift of its config (Turbo's 3.0)
+        if self.model_def.get("flow_shift", False):
+            self.scheduler.set_shift(shift)
+        # sigmas 1 - i/N (shifted): the N steps end on a real update instead of a pass at sigma 0
+        sigmas = [1.0 - i / sampling_steps for i in range(sampling_steps)] if self.model_def.get("uniform_sigmas", False) else None
+
         def _vae_upsampler_progress(_phase, current_step=None, total_steps=None):
             if callable(set_progress_status):
                 progress_label = getattr(vae_upsampler, "progress_label", "VAE Spatial Upsampling")
@@ -297,6 +308,7 @@ class model_factory:
             prompt=input_prompt,
             negative_prompt=n_prompt,
             num_inference_steps=sampling_steps,
+            sigmas=sigmas,
             sample_solver=sample_solver,
             guidance_scale=guide_scale,
             num_images_per_prompt=batch_size,

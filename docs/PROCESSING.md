@@ -37,6 +37,10 @@ Control Video processing tells the model what structure, motion, or area to foll
 
 If a Video Mask is provided, the selected process can apply only to the masked area or only to the non-masked area. This lets you keep a subject while changing the background, replace one person among several people, or combine different effects inside and outside the mask.
 
+A Control Video keeps its timing. At a rate within 0.1 frames per second of the model's, such as 23.976 for a 24 fps model, WanGP reads every frame without repeating or dropping any, and it records the result and places the sound on the video's real rate, so they stay together however long the video is.
+
+A part of a video named without encoding it (a view, or a path ending in `|start_frame=...,end_frame=...` or `|start_s=...,end_s=...`) can be any length, even one the model cannot render. WanGP fills the render by playing the part's last frames backwards, then trims the output back, so you get exactly its frames. Asking for clearly more than the part holds still extends it by temporal outpainting.
+
 WanGP previews processed Control Video and Video Mask thumbnails before generation. Use `--save-masks` when you need to inspect the full generated control media.
 
 ### Masks
@@ -128,6 +132,12 @@ When sliding windows are enabled, positional arguments such as injected-frame po
 
 If you continue from a Source Video, the Source Video is treated as the first window. The overlap size controls how many frames from that source or previous window are used to condition the next generated segment.
 
+A long Source Video does not need to fit in memory. WanGP reads only the last frames the first new window needs and leaves the rest in the file. If the Source Video already has the output's size, frame rate and video codec settings (for example a video WanGP generated with the same settings), its pictures are copied unchanged into the result; otherwise it is resized and encoded once. Each new window is then added to the result without encoding the previous frames again.
+
+Temporal Upsampling, Spatial Upsampling and Film Grain also apply to the Source Video. It goes through them once, a part at a time, so it still does not need to fit in memory, and each new window then processes only its own frames. A Source Video that already has the final size and frame rate (for example the result of an earlier generation with the same settings) is not processed again: its pictures are copied, so Film Grain is not added twice and nothing is upscaled a second time.
+
+A few choices still need the whole Source Video in memory: HDR output, an upsampler that works on the whole video at once (the LTX-2 upscalers and Detail Refiner, the face refiners), and frame interpolation combined with an AI upscaler. The console then reports why and how much RAM this takes, and the generation (or an extra window) is refused when the Source Video and the new frames together exceed 3000 frames. Apply these steps afterwards in Post Processing, or keep fewer frames of the Source Video, to continue a very long video.
+
 How sliding windows work:
 
 - Each window uses the matching time segment of the Control Video.
@@ -149,11 +159,17 @@ Choose how window prompts are separated with **How to Process each Line of the T
 
 Each window prompt may begin with optional `[/...]` commands. Use `[/overlap=9]` to select a different overlap for that transition, or `[/overlap]` to restore the model's default overlap. On text-to-video-capable models, `[/overlap=0]` creates a hard cut by preventing the preceding window from conditioning the new one; `[/new_shot]` is its more explicit alias. Different window lengths can be requested with `[/duration=121]`, `[/duration=5s]`, or `[/duration=20%]`. When duration commands are present, they define the window schedule and predicted final length instead of treating the UI's Number of Frames as a strict final cap; windows without an explicit duration consume the remaining requested frames, up to the configured Sliding Window Size. Commands can be combined, for example `[/duration=4s,/new_shot]`.
 
+When generating sound with LTX-2, MiniMax H3 or Ovi, WanGP aligns each window's audio to the video timeline and replaces a short ending of the preceding soundtrack with newly generated overlap. This also applies to Continue Video: the source's ending may be replaced even if it came from another model or was never padded. Keep the model's default overlap; if WanGP reports that it is too short for audio repair, increase it to an allowed value. This prevents accumulated timing drift; Ovi still generates each window's sound independently, so sound or voice continuity is not guaranteed. MiniMax H3 generates a little sound past each window's last frame, so its windows join without replacing anything, and the videos it saves keep about 0.1 s of sound after the last frame: continuing such a video reuses its whole soundtrack. Players may show these videos 0.1 s longer, holding the last frame.
+
+A control or source soundtrack selected for preservation keeps its original audio. Audio supplied only as a generation reference does not imply preservation. A deliberate cut without overlap can retain a short silent gap if the preceding generated soundtrack ends early.
+
+With these models, if the generated soundtrack ends slightly before the final video frame, WanGP fills the remaining ending with silence when saving. This keeps the complete video; that export padding is not reused to condition the next sliding window. H3 native continuation requires the source soundtrack to reach close to the video's end; WanGP reports when the gap is too long to repair.
+
 Sliding-window settings:
 
 - **Window Size:** choose a duration that fits the motion and model quality.
 - **Overlap Frames:** use enough overlap for continuity, but not so much that blur propagates.
-- **Discard Last Frames:** remove weak final frames from each window when a model tends to blur at the end.
+- **Discard Last Frames:** remove weak final frames from each window when a model tends to blur at the end. With MiniMax H3 any number of frames can be discarded; when a window has an end image and another window follows, that end image is generated just after the discarded frames. It steers the action without being shown, which hides the jump onto an end image the action did not reach (about 5 frames is enough). The last window still ends exactly on its end image.
 - **Add Overlapped Noise:** may help some workflows, but can reduce quality in others.
 
 ## After Generation: Postprocessing
@@ -161,6 +177,8 @@ Sliding-window settings:
 Postprocessing is applied after media exists. It can run immediately after generation or later from the Media Info / Late Post Processing area.
 
 Use postprocessing when the content is good but the final media needs a technical or finishing pass.
+
+A long video does not need to fit in memory: Late Post Processing reads, processes and saves it a part at a time, whatever its length. This applies to Lanczos, FlashVSR, SeedVR2, RelayVSR, DLSS 5, RIFE, DLSS frame generation and Film Grain. The exceptions listed under Continue Video (the LTX-2 upscalers and Detail Refiner, the face refiners, frame interpolation combined with an AI upscaler) load the video whole and keep its first 3000 frames. For pausing and resuming a long job, or choosing the length of the parts yourself, use Media Flow.
 
 Common postprocessing jobs:
 
@@ -170,7 +188,37 @@ Common postprocessing jobs:
 - Cropping, resizing, or importing existing media for a later workflow.
 - Applying a system postprocessing model through MediaFlow.
 
+SeedVC voice replacement, also used by Scenema Audio for reference voices, is distributed separately under the GPL-3.0 license. WanGP downloads it automatically from https://github.com/deepbeepmeep/WanGP-SeedVC the first time you use it, so that first use needs internet access.
+
+**SeedVC Voice Replacement** in **Configuration > Extensions** defaults to **v1.0 Singing**, which Showrunner requires for changing a song's singer or duet voices. **v1.0 Speech** and **v2 Speech** remain available for spoken audio. There is no Off choice; existing Off selections become v1.0 Singing.
+
 Late postprocessing is useful when you want to improve existing media without regenerating the original scene.
+
+### Face Refinement
+
+Face refiners find and follow up to five faces, restore each one and paste it back: the rest of the picture and the video's resolution do not change. Set *Faces to Refine* to `0` to let WanGP pick the relevant faces.
+
+- **H3 Face Refiner** restores faces with the H3 model, a text description and the soundtrack, which the model hears as it does when generating. Mouths stay closer to the source's, and it reuses H3 when H3 is already loaded.
+- **TaoMate-FVSR Face Refiner** restores speaking and singing faces from the soundtrack: lips and teeth come out sharp and follow the audio, with more skin and eye detail. It takes no prompt and pushes the mouth toward the audio much harder than H3 Face Refiner, so it is the one to try when a mouth looks wrong, and the mouth can differ more from the source.
+
+| | H3 Face Refiner | TaoMate-FVSR Face Refiner |
+|---|---|---|
+| **Choose it for** | Keeping the source's mouth movements; small or distant faces | Close-ups; a mouth that looks wrong |
+| **Detail** | Less skin, eye and teeth detail on close-ups | Sharpest lips and teeth, most skin and eye detail on close-ups |
+| **Mouth** | Stays close to the source; does little to correct a wrong mouth | Pushed toward the soundtrack: closed lips may open, and a face following the soundtrack mouths its words even if that person is only listening |
+| **Rest of the face** | Expressions and the upper face can change | On close-ups the upper face and identity stay close to the source; on small or distant faces, mouths open wider and the face is less faithful than with H3 |
+| **Control** | Accepts a prompt (Late Post Processing) | No prompt; you choose which faces follow the soundtrack |
+| **Speed and memory** | Faster with several faces, a little less VRAM; reuses H3 when it is already loaded | Faster on a single close-up; faces large in the frame take several times longer; SeedVR2 downloads with it |
+
+TaoMate-FVSR choices:
+
+- **Faces Following the Soundtrack:** a face following the soundtrack mouths its words even if that person is only listening. *Largest Face* (the default) suits one speaker with others around; use *All Faces* when everyone sings or speaks together, and *No Face* to restore detail from the picture alone. A video without audio is always restored from the picture alone.
+- **Face Refinement Strength** blends the result over the source. Below 1 the original mouth can show through the new one, so keep it at 1 unless you see a change you dislike.
+- **Optional Face Reference Images** (Late Post Processing) work as for H3 Face Refiner: each picture is matched to the person it shows, and gives the model the clean detail of that face. Without one, the images the video was generated from are used when its file holds them. A person left without a picture uses the best frame of their own track: the largest, sharpest and most frontal. If that frame is damaged too, some of the damage can remain: supply a clean picture of that person.
+- **Reference Restorer** (in *Configuration / Extensions*) restores that frame, or a small supplied picture, before the model uses it. SeedVR2 is the default and downloads with the refiner; with *None* faces stay softer.
+- **Working Size** (in *Configuration / Extensions*): *Auto* works at 512 and moves to 1024 for faces large in the frame. 1024 takes several times longer and more VRAM.
+
+Limitations: new facial detail is an estimate, not the person's true appearance, and the mouth may differ from the source because it follows the audio. Video frame rates near 25 fps match its training best, and clear speech gives the most reliable lips; music and very fast cuts are less predictable.
 
 ### Detail Refinement Up To 8K
 

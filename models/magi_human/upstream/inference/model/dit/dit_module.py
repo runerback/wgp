@@ -11,10 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 
-##### Enjoy this spagheti VRAM optimizations done by DeepBeepMeep !
-# I am sure you are a nice person and as you copy this code, you will give me officially proper credits:
-# Please link to https://github.com/deepbeepmeep/Wan2GP and @deepbeepmeep on twitter  
 
 import importlib
 from dataclasses import dataclass
@@ -706,6 +704,7 @@ class Adapter(torch.nn.Module):
         text_mask: torch.Tensor,
     ):
         rope = self.rope(coords_mapping)
+        x = x.to(self.config.params_dtype)  # FP32 tokens: the FP32 lock leaves them to this cast, which MMGP made before
         output_x = torch.zeros(x.shape[0], self.config.hidden_size, device=x.device, dtype=self.config.params_dtype)
         output_x[text_mask] = self.text_embedder(x[text_mask, : self.config.text_in_channels])
         output_x[audio_mask] = self.audio_embedder(x[audio_mask, : self.config.audio_in_channels])

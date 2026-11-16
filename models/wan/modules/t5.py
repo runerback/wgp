@@ -1,5 +1,6 @@
 # Modified from transformers.models.t5.modeling_t5
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+# Modifications Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import logging
 import math
 from functools import lru_cache
@@ -691,7 +692,7 @@ class T5EncoderModel:
                 dtype=dtype,
                 device=device).eval().requires_grad_(False)
         logging.info(f'loading {checkpoint_path}')
-        from mmgp import offload
+        from mmgp import offload, runtime
         offload.load_model_data(
             model,
             checkpoint_path,
@@ -699,6 +700,7 @@ class T5EncoderModel:
             default_dtype=torch.bfloat16,
             preprocess_sd=_preprocess_umt5_state_dict,
         )
+        runtime.lookup_on_cpu(model.token_embedding)  # the 2 GB token table stays in RAM: mmgp looks up the prompt's rows on the CPU
 
         self.model = model
         self.model.to(self.device)

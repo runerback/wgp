@@ -1,5 +1,6 @@
 # Modified from ``https://github.com/openai/CLIP'' and ``https://github.com/mlfoundations/open_clip''
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+# Modified for WanGP.
 import logging
 import math
 
@@ -524,6 +525,8 @@ class CLIPModel:
         #     torch.load(checkpoint_path, map_location='cpu'), assign= True)
 
         offload.load_model_data(self.model, checkpoint_path.replace(".pth", "-bf16.safetensors"), writable_tensors=False, default_dtype=None)
+        from mmgp import runtime
+        runtime.unused(self.model.textual)  # only the image tower runs: the text tower and its 0.5 GB token table stay in RAM
 
         # init tokenizer
         self.tokenizer = HuggingfaceTokenizer(

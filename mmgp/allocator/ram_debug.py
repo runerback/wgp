@@ -38,6 +38,7 @@ import types
 import torch
 
 from . import debug as _vram_debug
+from . import events as _events
 from . import ram as _ram
 
 GB, MB, KB = 2 ** 30, 2 ** 20, 2 ** 10
@@ -449,7 +450,7 @@ def _find_objects():
     numpy = _numpy()
     pil, offload = sys.modules.get("PIL.Image"), sys.modules.get("mmgp.offload")  # looked up, never imported by a census
     slots = [("tensors", torch.Tensor), ("storages", torch.UntypedStorage), ("storages", torch.TypedStorage)]
-    slots += [("registrations", offload._HostRegistration), ("offloads", offload.offload)] if offload is not None else []
+    slots += [("registrations", sys.modules["mmgp.pinned"].Registration), ("offloads", offload.offload)] if offload is not None else []
     slots += [("images", pil.Image)] if pil is not None else []
     found = {"tensors": [], "storages": [], "arrays": {}, "bytes": {}, "images": [], "registrations": [], "offloads": []}
     slot_of = found["types"] = {}  # type -> slot name, or "" when the type holds nothing of interest
@@ -492,21 +493,79 @@ def _find_objects():
     return found
 
 
+def _model_tensors(model):
+    """(path, tensor) of the parameters and buffers of model and of the inner tensors of wrapper subclasses (quantized weights), each once."""
+    seen = set()
+    for path, module in model.named_modules():  # memoized: module graphs with cycles (a child refers to its parent) are walked once
+        for name, tensor in list(module._parameters.items()) + list(module._buffers.items()):
+            pending = [(tensor, f"{path}.{name}" if path else name)]
+            while pending:
+                tensor, tensor_path = pending.pop()
+                if isinstance(tensor, torch.Tensor) and id(tensor) not in seen:
+                    seen.add(id(tensor))
+                    yield tensor_path, tensor
+                    if hasattr(type(tensor), "__tensor_flatten__"):
+                        pending += [(getattr(tensor, attribute, None), f"{tensor_path}.{attribute}") for attribute in tensor.__tensor_flatten__()[0]]
+
+
+def _offload_models(offloads):
+    return {model_id: model for offloader in offloads for model_id, model in (offloader.models or {}).items() if isinstance(model, torch.nn.Module)}
+
+
 def _model_names(offloads):
     names = {}
-    for offloader in offloads:
-        for model_id, model in (offloader.models or {}).items():
-            if isinstance(model, torch.nn.Module):
-                for path, module in model.named_modules():  # memoized: module graphs with cycles (a child refers to its parent) are walked once
-                    for name, tensor in list(module._parameters.items()) + list(module._buffers.items()):
-                        pending = [(tensor, f"{path}.{name}" if path else name)]
-                        while pending:  # the tensor, and the inner tensors of a wrapper subclass (quantized weights)
-                            tensor, tensor_path = pending.pop()
-                            if isinstance(tensor, torch.Tensor) and id(tensor) not in names:
-                                names[id(tensor)] = (model_id, tensor_path)
-                                if hasattr(type(tensor), "__tensor_flatten__"):
-                                    pending += [(getattr(tensor, attribute, None), f"{tensor_path}.{attribute}") for attribute in tensor.__tensor_flatten__()[0]]
+    for model_id, model in _offload_models(offloads).items():
+        for path, tensor in _model_tensors(model):
+            names.setdefault(id(tensor), (model_id, path))
     return names
+
+
+def weight_backing(models, top=8, regions=None):
+    """Where the CPU weights of models live. Weights read from a checkpoint file through a memory mapping cost no private RAM: under memory
+    pressure the system drops their pages and rereads them from the file. Weights in private RAM (made at load: dtype conversions,
+    concatenations, merged LoRAs, quantization at load) are written to the page file instead, and read back at their next use. Pinned weights
+    (locked RAM) are never paged out. Returns {model_id: {file_gb, private_gb, pinned_gb, files {name: GiB}, private [groups of tensors whose
+    names differ by their block numbers, largest first: tensors, count, gb, mb_mean, type], private_groups}}."""
+    lookup = _region_lookup(regions if regions is not None else reservations(residency=False))
+    cuda = torch.cuda.is_available() and torch.cuda.is_initialized()
+    result = {}
+    for model_id, model in models.items():
+        totals, files, groups, seen = collections.Counter(), collections.Counter(), {}, set()
+        for path, tensor in _model_tensors(model):
+            if tensor.device.type != "cpu" or hasattr(type(tensor), "__tensor_flatten__"):
+                continue  # on the GPU or the meta device, or a wrapper subclass whose inner tensors are listed
+            pointer, nbytes = tensor.data_ptr(), tensor.numel() * tensor.element_size()
+            if not nbytes or (pointer, nbytes) in seen:
+                continue  # tied weights are counted once
+            seen.add((pointer, nbytes))
+            region = lookup(pointer)
+            if region is not None and region["kind"] == "mapped" and region["path"]:
+                where = "file"
+                files[os.path.basename(region["path"])] += nbytes
+            elif cuda and tensor.is_pinned():
+                where = "pinned"
+            else:
+                where = "private"
+                group = groups.setdefault(re.sub(r"(^|\.)\d+(?=\.)", r"\1*", path), {"count": 0, "bytes": 0, "type": f"{type(tensor).__name__} {str(tensor.dtype).replace('torch.', '')}"})
+                group["count"] += 1
+                group["bytes"] += nbytes
+            totals[where] += nbytes
+        largest = sorted(groups.items(), key=lambda item: -item[1]["bytes"])
+        result[model_id] = {"file_gb": round(totals["file"] / GB, 3), "private_gb": round(totals["private"] / GB, 3), "pinned_gb": round(totals["pinned"] / GB, 3),
+                            "files": {name: round(size / GB, 3) for name, size in files.most_common()}, "private_groups": len(largest),
+                            "private": [{"tensors": name, "count": group["count"], "gb": round(group["bytes"] / GB, 3), "mb_mean": round(group["bytes"] / group["count"] / MB, 1),
+                                         "type": group["type"]} for name, group in largest[:top]]}
+    return result
+
+
+def weight_backing_text(model_id, info):
+    """One line on where the CPU weights of a model live (see weight_backing)."""
+    text = f"Weights of '{model_id}' in RAM: {info['file_gb']:.2f} GiB read from checkpoint files, {info['private_gb']:.2f} GiB in private RAM"
+    text += f", {info['pinned_gb']:.2f} GiB pinned" if info["pinned_gb"] else ""
+    if info["private"] and info["private"][0]["gb"] >= 0.01:
+        group = info["private"][0]
+        text += f" (largest: {group['tensors']}, {group['count']} x {group['mb_mean']:.1f} MB {group['type']})"
+    return text
 
 
 def _buffers(found):
@@ -599,8 +658,13 @@ def _edge(parent, child):
     if isinstance(parent, (set, frozenset)):
         return "{...}"
     if isinstance(parent, types.FrameType):
+        if parent.f_back is child:
+            return " .f_back"
         try:
-            for key, value in parent.f_locals.items():
+            frame_locals = parent.f_locals  # Python 3.11-3.12: a dict made on the frame, which then refers to the values (see render)
+            if frame_locals is child:
+                return " .f_locals"
+            for key, value in frame_locals.items():
                 if value is child:
                     return f" local {key}"
         except Exception:
@@ -645,7 +709,7 @@ def _object_text(obj):
     return type(obj).__name__
 
 
-def _holder_paths(targets, budget_s, max_depth=14, level_cap=1000, paths_per_target=2):
+def _holder_paths(targets, budget_s, max_depth=20, level_cap=1000, paths_per_target=2):
     """For each key of targets ({key: [objects]}), up to paths_per_target chains of references from a root (module global, running frame,
     class attribute) to one of its objects, found by walking the referrers backwards. Returns ({key: [text]}, complete)."""
     deadline = time.perf_counter() + budget_s
@@ -745,12 +809,15 @@ def _holder_paths(targets, budget_s, max_depth=14, level_cap=1000, paths_per_tar
             label = _edge(parent, child)
             if path[index - 1] in module_dicts and label.startswith("['"):
                 label = "." + label[2:-2]
-            if label == ".__dict__" and index + 1 < len(path):  # obj -> obj.__dict__ -> value reads as obj.attribute
+            if label in (".__dict__", " .f_locals") and index + 1 < len(path):  # obj -> obj.__dict__ -> value reads as obj.attribute, a frame's locals as local
                 key = _edge(child, keep[path[index + 1]])
-                parts.append(f".{key[2:-2]}" if key.startswith("['") else key)
+                parts.append((f".{key[2:-2]}" if label == ".__dict__" else f" local {key[2:-2]}") if key.startswith("['") else key)
                 index += 2
                 continue
-            parts.append(label or f" -> {_object_text(child)}")
+            if isinstance(child, types.FrameType):
+                parts.append(f"{label} -> {_object_text(child)}{'' if path[index] in running else ', finished'}")
+            else:
+                parts.append(label or f" -> {_object_text(child)}")
             index += 1
         return "".join(parts)
 
@@ -916,12 +983,16 @@ def _census_objects(min_bytes, holders, budget_s):
     found = _find_objects()
     buffers, images, totals = _buffers(found)
     registrations = _registrations(found)
+    weights = weight_backing(_offload_models(found["offloads"]))
     found_time = time.perf_counter() - started
     found_types = list(found["types"])
     del found
     top = sorted((item for item in buffers.items() if item[1]["nbytes"] >= min_bytes and not item[1]["models"]), key=lambda item: -item[1]["nbytes"])[:30]
     paths, complete, holder_time = {}, True, 0.0
-    targets = {pointer: buffer["objects"] for pointer, buffer in top} if holders else {}
+    representative = {}  # (kind, what) -> the first pointer of that kind: identical blocks (the weights of a model) share their holders
+    for pointer, buffer in top:
+        representative.setdefault((buffer["kind"], buffer["what"]), pointer)
+    targets = {pointer: buffer["objects"] for pointer, buffer in top if representative[(buffer["kind"], buffer["what"])] == pointer} if holders else {}
     for buffer in buffers.values():
         buffer["objects"] = None  # no reference left but the targets' (the holder search skips them), none in the report
     if targets:
@@ -931,8 +1002,12 @@ def _census_objects(min_bytes, holders, budget_s):
     del targets
     types_by_address = {id(kind): kind for kind in found_types}
     types_by_address.update({id(kind): kind for kind in (bytes, bytearray, str, int, float, tuple)})
+    for pointer, buffer in top:  # the other blocks of a kind refer to the first one's holders
+        first = representative[(buffer["kind"], buffer["what"])]
+        if holders and first != pointer:
+            paths[pointer] = [f"(as the {first:#x} {buffer['what']} above)"]
     return {"buffers": buffers, "images": images, "totals": totals, "registrations": registrations, "top": top, "paths": paths, "complete": complete, "types": types_by_address,
-            "garbage": garbage, "times": (round(found_time, 2), round(holder_time, 2))}
+            "garbage": garbage, "times": (round(found_time, 2), round(holder_time, 2)), "weights": weights}
 
 
 def _region_lookup(found_regions):
@@ -954,8 +1029,8 @@ def census(min_mb=16, objects=True, holders=True, budget_s=20, label="census", _
     objs = _census_objects(min_bytes, holders, budget_s) if objects else None
     hook_blocks = _hook.blocks() if _hook is not None else None
     registrations = set(objs["registrations"]) if objs else set()
-    if _rec is not None:  # the registrations made while recording are followed as they happen (see _watch_mmgp)
-        registrations |= {(pointer, size, cls) for pointer, (size, cls) in list(_rec.pinned.items())}
+    if _rec is not None:  # the registrations made while recording are followed as they happen (see events.py)
+        registrations |= {(pointer, info["size"], info["cls"]) for pointer, info in list(_events.registrations.items())}
     registrations = sorted(registrations)
     found_regions = reservations()
     evidence = _evidence(objs["buffers"] if objs else None, registrations, hook_blocks)
@@ -1024,6 +1099,7 @@ def census(min_mb=16, objects=True, holders=True, budget_s=20, label="census", _
         result["vram_spilled_to_ram"] = vmm
     if objs:
         result["objects"] = _objects_report(objs, min_bytes)
+        result["weights"] = objs["weights"]
         if WINDOWS and _hook is not None:
             result["c_heap"] = _hook.heap_report(objs["buffers"], registrations, objs["types"])
     if _hook is not None:
@@ -1050,7 +1126,7 @@ def _objects_report(objs, min_bytes):
             model_counts[model] += 1
     top = []
     for pointer, buffer in objs["top"]:
-        top.append({"mb": round(buffer["nbytes"] / MB, 1), "kind": buffer["kind"], "what": buffer["what"], "memory": buffer["cls"],
+        top.append({"mb": round(buffer["nbytes"] / MB, 1), "kind": buffer["kind"], "what": buffer["what"], "memory": buffer["cls"], "pointer": f"{pointer:#x}",
                     "holders": objs["paths"].get(pointer, [])})
     images = sorted(objs["images"], key=lambda item: -item[0])
     garbage_count, garbage_bytes, cycles = objs["garbage"]
@@ -1275,7 +1351,7 @@ def _ram_where(rec, stack_id):
     """The allocation site: the innermost frame of the application's code, with the mmgp function that allocated for it (pinning, staging)."""
     where = _vram_debug._where(rec, stack_id)
     for code, line in rec.stack_frames[stack_id]:
-        if code.co_filename.endswith(os.path.join("mmgp", "offload.py")):
+        if code.co_filename.endswith((os.path.join("mmgp", "offload.py"), os.path.join("mmgp", "pinned.py"))):
             name = getattr(code, "co_qualname", code.co_name)
             return f"{where} (mmgp {name})" if code.co_name not in where else where
     return where
@@ -1319,6 +1395,9 @@ class _Recording:
         self.stop_event, self.sampler, self.last_light = threading.Event(), None, 0.0
         self.peak = {"private": 0, "resident": 0}
         self.history = []  # what each census of a report keeps for the following reports: the trend of the whole recording
+        # the peak of the whole recording (not reset by the reports), with the system's RAM: the least available, other processes at the peak
+        self.peak_all = {"private": 0, "resident": 0, "time_s": 0.0, "phase": None, "available_min": None, "others_at_peak": None}
+        self.event_cursor, self.release_cursor, self.last_label, self.ram_stats = 0, 0, None, None
 
 
 def _new_phase(rec, name):
@@ -1343,6 +1422,13 @@ def _sample(rec):
                 phase["peak_resident"] = max(phase["peak_resident"], values["resident"])
                 rec.peak["private"] = max(rec.peak["private"], values["private"])
                 rec.peak["resident"] = max(rec.peak["resident"], values["resident"])
+            available, physical = _available()
+            with rec.lock:
+                peak_all = rec.peak_all
+                if values["private"] > peak_all["private"]:
+                    peak_all.update(private=values["private"], time_s=round(now, 2), phase=rec.phase, others_at_peak=max(0, physical - available - values["resident"]))
+                peak_all["resident"] = max(peak_all["resident"], values["resident"])
+                peak_all["available_min"] = available if peak_all["available_min"] is None else min(peak_all["available_min"], available)
                 due = values["private"] >= phase["census_private"] + max(256 * MB, values["private"] // 20) and now - rec.last_light >= 1.0
             if due:  # a light census (address space and hooked allocations) near the peak of the phase
                 light = census(objects=False, label=f"peak of {phase['name']}", _hook=rec.hook)
@@ -1364,22 +1450,6 @@ def _watch_mmgp(rec):  # a phase per model that mmgp's offload loads to the GPU,
             return _original(self, model_id, *args, **kwargs)
         setattr(offload.offload, attribute, wrapped)
         rec.patched.append((offload.offload, attribute, original))
-    registration = offload._HostRegistration
-    original_register, original_close = registration.register, registration.close
-
-    def register(self):
-        error = original_register(self)
-        if int(error) == 0:
-            rec.pinned[self.pointer] = (self.size, "pinned_ring" if isinstance(self.buffer, torch.Tensor) else "pinned_mmgp")
-        return error
-
-    def close(self):
-        closed = original_close(self)
-        if closed:
-            rec.pinned.pop(self.pointer, None)
-        return closed
-    registration.register, registration.close = register, close
-    rec.patched += [(registration, "register", original_register), (registration, "close", original_close)]
 
 
 def start(min_mb=16, stacks=True, hooks=True, sample_ms=50, holders_budget_s=20, watch_mmgp=True):
@@ -1397,6 +1467,8 @@ def start(min_mb=16, stacks=True, hooks=True, sample_ms=50, holders_budget_s=20,
         else:
             rec.hook = _Hook(lib, rec)
     _vram_debug._use_module_hooks()
+    _events.start()
+    rec.event_cursor, rec.release_cursor = len(_events.events), len(_events.releases)
     if watch_mmgp:
         _watch_mmgp(rec)
     _rec = rec
@@ -1423,6 +1495,7 @@ def stop():
     _vram_debug._release_module_hooks()
     for owner, attribute, original in rec.patched:
         setattr(owner, attribute, original)
+    _events.stop()
 
 
 def active():
@@ -1461,7 +1534,7 @@ def reset():
         rec.peak = {"private": 0, "resident": 0}
     if rec.hook is not None:
         rec.hook.reset()
-    mark("start")
+    mark(f"after {rec.last_label}" if rec.last_label else "start")
 
 
 def _trend_entry(label, snap):
@@ -1469,7 +1542,11 @@ def _trend_entry(label, snap):
     objects, hook = snap.get("objects") or {"top": []}, snap.get("hook") or {}
     return {"label": f"{label}, {snap['label']}" if label else snap["label"], "census": snap["label"], "time_s": snap["time_s"],
             "private_gb": snap["process"]["private_gb"], "resident_gb": snap["process"]["resident_gb"], "classes": {row["label"]: row["private_gb"] for row in snap["classes"]},
-            "objects": [{"mb": item["mb"], "what": item["what"], "memory": item["memory"], "held_by": item["holders"][0] if item["holders"] else ""} for item in objects["top"]],
+            "resident_classes": {row["label"]: row["resident_gb"] for row in snap["classes"]},
+            "mapped_files_gb": round(sum(item["resident_gb"] for item in snap.get("files", []) if item["kind"] == "data"), 3),
+            "files": [{"file": item["file"], "resident_gb": item["resident_gb"]} for item in snap.get("files", []) if item["kind"] == "data"][:8],
+            "objects": [{"mb": item["mb"], "what": item["what"], "memory": item["memory"], "pointer": item.get("pointer"), "held_by": item["holders"][0] if item["holders"] else ""}
+                        for item in objects["top"]],
             "allocations": [{"mb": round(group["mb"], 1), "count": group["count"], "kind": group["kind"], "where": group["where"], "stack": group["stack"]} for group in hook.get("groups", [])]}
 
 
@@ -1487,6 +1564,80 @@ def _phase_report(rec, phase, hook_phase):
         result["hooked_at_peak"] = {"torch_gb": round(header.torch_live / GB, 3), "numpy_gb": round(header.numpy_live / GB, 3), "time_s": round(header.time + rec.hook.offset, 2),
                                     "groups": _hook_groups(rec, large, header.time)}
     return result
+
+
+def _available():
+    """(available, physical) RAM of the system, in bytes."""
+    info = system()
+    return int(info["available_gb"] * GB), int(info["physical_gb"] * GB)
+
+
+def _release_reports(rec, releases):
+    """The MMGP releases since the previous report: the models still alive now (with the chains that hold them) and their RAM still pinned."""
+    result = []
+    for release in releases:
+        alive = {model_id: info["ref"]() for model_id, info in release["models"].items()}
+        alive = {model_id: model for model_id, model in alive.items() if model is not None}
+        pinned = _events.pinned_by_owner(set(release["models"]))
+        paths = _holder_paths({model_id: [model] for model_id, model in alive.items()}, min(10, rec.holders_budget_s))[0] if alive else {}
+        result.append({"time_s": round(release["t"] - rec.t0, 2), "models": {model_id: info["class"] for model_id, info in release["models"].items()},
+                       "files": {model_id: info["files"] for model_id, info in release["models"].items() if info["files"]},
+                       "pinned_at_release_gb": round(sum(info["pinned"] for info in release["models"].values()) / GB, 3),
+                       "still_pinned": {owner: {"blocks": count, "gb": round(size / GB, 3)} for owner, (count, size) in pinned.items()},
+                       "alive": {model_id: paths.get(model_id, []) for model_id in alive}})
+        del alive
+    return result
+
+
+def _frame_text(frame):
+    return f"{frame.f_code.co_name} ({frame.f_code.co_filename.replace(chr(92), '/').rsplit('/', 1)[-1]}:{frame.f_lineno})"
+
+
+def _retained_frames(top=10):
+    """Exceptions, tracebacks and frames that module globals (or sys.last_exc) keep: a frame keeps its locals, and through f_back the frames
+    of its callers with theirs, so a stored exception keeps the whole call stack where it was raised, with the objects it was handling."""
+    candidates = [(f"sys.{name}", getattr(sys, name, None)) for name in ("last_exc", "last_value", "last_traceback")]
+    for module in list(sys.modules.values()):
+        if isinstance(module, types.ModuleType):
+            try:
+                items = list(vars(module).items())
+            except Exception:
+                continue
+            # by type only: isinstance would run __class__ properties (deprecated or lazy attributes)
+            candidates += [(f"{module.__name__}.{key}", value) for key, value in items if issubclass(type(value), (BaseException, types.TracebackType, types.FrameType))]
+    running = set()
+    for top_frame in sys._current_frames().values():
+        while top_frame is not None:
+            running.add(id(top_frame))
+            top_frame = top_frame.f_back
+    result, seen = [], set()
+    for held_by, value in candidates:
+        if value is None or id(value) in seen:
+            continue
+        seen.add(id(value))
+        frame, exception = None, value if issubclass(type(value), BaseException) else None
+        if exception is not None:
+            frame = exception.__traceback__.tb_frame if exception.__traceback__ is not None else None
+        elif type(value) is types.TracebackType:
+            frame = value.tb_frame
+        else:
+            frame = value
+        if frame is None:
+            continue
+        chain, tensors_gb, modules = [], 0.0, []
+        while frame is not None and len(chain) < 40:
+            chain.append(_frame_text(frame) + ("" if id(frame) in running else ", finished"))
+            if id(frame) not in running:
+                for key, local in frame.f_locals.items():
+                    if isinstance(local, torch.Tensor) and not local.is_cuda:
+                        tensors_gb += local.untyped_storage().nbytes() / GB
+                    elif isinstance(local, torch.nn.Module):
+                        files = _events.sources(local)
+                        modules.append(f"{key} ({type(local).__name__}{'; ' + ', '.join(files) if files else ''})")
+            frame = frame.f_back
+        result.append({"held_by": held_by, "what": type(value).__name__ + (f": {str(value)[:100]}" if exception is not None else ""), "frames": chain,
+                       "local_cpu_tensors_gb": round(tensors_gb, 3), "local_modules": modules[:20]})
+    return result[:top]
 
 
 def report(path=None, label=None, snapshot_label="report"):
@@ -1531,8 +1682,24 @@ def report(path=None, label=None, snapshot_label="report"):
         used |= {group["stack"] for key in ("groups", "unheld") for group in snap.get("hook", {}).get(key, [])}
     used |= {origin["stack"] for origin in origins[:200]}
     used |= {group["stack"] for entry in rec.history[-2:] for group in entry["allocations"]}
+    entries, rec.event_cursor = _events.since(rec.event_cursor)
+    releases, rec.release_cursor = _release_reports(rec, _events.releases[rec.release_cursor:]), len(_events.releases)
+    allocator = _ram.stats() if _ram.active else None
+    allocator_report = None if allocator is None else {"settings": dict(_ram.settings), "now": allocator,
+                                                       "since_previous_report": {key: value - (rec.ram_stats or {}).get(key, 0) for key, value in allocator.items()}}
+    rec.ram_stats, rec.last_label = allocator, label
+    with rec.lock:
+        peak_all = dict(rec.peak_all)
+    process = counters()
     result = {"created": time.strftime("%Y-%m-%d %H:%M:%S"), "label": label, "platform": f"{sys.platform} {platform.machine()}", "threshold_mb": rec.min_mb,
               "hooks": "PyTorch CPU allocator and NumPy" if rec.hook is not None else rec.hook_note, "peak": _gb(peak), "baseline": rec.baseline, "phases": phases,
+              "recording_peak": {"private_gb": round(peak_all["private"] / GB, 3), "resident_gb": round(peak_all["resident"] / GB, 3), "time_s": peak_all["time_s"],
+                                 "phase": peak_all["phase"], "process_peak_private_gb": None if process["peak_private"] is None else round(process["peak_private"] / GB, 3),
+                                 "available_min_gb": None if peak_all["available_min"] is None else round(peak_all["available_min"] / GB, 2),
+                                 "other_processes_at_peak_gb": None if peak_all["others_at_peak"] is None else round(peak_all["others_at_peak"] / GB, 2)},
+              "releases": releases, "pinned_by_owner": {owner: {"blocks": count, "gb": round(size / GB, 3), "pool_blocks": pooled.get(owner, 0), "files": _events.owner_files.get(owner, [])}
+                                                        for pooled in [_events.pooled_by_owner()] for owner, (count, size) in _events.pinned_by_owner().items()},
+              "retained_frames": _retained_frames(), "ram_allocator": allocator_report, "events": _events.as_json(entries, rec.t0),
               "snapshots": rec.snapshots, "history": rec.history, "origins": origins[:200],
               "stacks": {str(stack_id): [_vram_debug._frame_text(code, line) for code, line in rec.stack_frames[stack_id][:40]] for stack_id in sorted(used) if stack_id >= 0}}
     if path:
@@ -1626,6 +1793,18 @@ def _census_summary(snap, title):
                 holders = "<br>".join(item["holders"]) or "-"
                 text.append(f"| {item['mb']:.0f} | {item['what']} | {item['memory']} | {holders} |\n")
             text.append("\n")
+    weights = snap.get("weights")
+    if weights:
+        text.append("| model | weights read from checkpoint files, GiB | in private RAM (paged out to disk under memory pressure), GiB | pinned, GiB |\n|---|---:|---:|---:|\n")
+        for model_id, info in weights.items():
+            text.append(f"| {model_id} | {info['file_gb']:.2f} | {info['private_gb']:.2f} | {info['pinned_gb']:.2f} |\n")
+        text.append("\n")
+        rows = [(model_id, group) for model_id, info in weights.items() for group in info["private"] if group["gb"] >= 0.01]
+        if rows:
+            text.append("| model | weights in private RAM (block numbers as *) | tensors | GiB | type |\n|---|---|---:|---:|---|\n")
+            for model_id, group in sorted(rows, key=lambda row: -row[1]["gb"])[:20]:
+                text.append(f"| {model_id} | {group['tensors']} | {group['count']} | {group['gb']:.2f} | {group['type']} |\n")
+            text.append("\n")
     heap = snap.get("c_heap")
     if heap:
         sizes = ", ".join(f"{row['blocks']} {row['gb']:.2f} GiB ({row['count']})" for row in heap["by_size"] if row["count"])
@@ -1650,11 +1829,64 @@ def _census_summary(snap, title):
     return "".join(text)
 
 
+def _allocator_summary(allocator):
+    now, delta, settings = allocator["now"], allocator["since_previous_report"], allocator["settings"]
+    return (f"MMGP RAM allocator (blocks of {settings.get('min_mb', '?')} MB and more, cache cap {settings.get('cache_gb', '?')} GiB, gives its cache back under "
+            f"{settings.get('pressure_gb', '?')} GiB available): in use {now['live'] / GB:.2f} GiB, cached {now['cached'] / GB:.2f} GiB, peak {now['peak'] / GB:.2f} GiB. "
+            f"Since the previous report: {delta['allocations']} allocations ({delta['hits']} reused a cached block, {delta['fresh']} fresh), "
+            f"{delta['releases']} blocks given back ({delta['released_bytes'] / GB:.2f} GiB), {delta['trims']} trims, {delta['fallbacks']} fallbacks to PyTorch's allocator.\n\n")
+
+
+def _releases_summary(releases):
+    text = ["## Model releases since the previous report\n\n"]
+    for release in releases:
+        still = sum(item["gb"] for item in release["still_pinned"].values())
+        detail = ", ".join(f"{owner} {item['blocks']} blocks {item['gb']:.2f} GiB" for owner, item in release["still_pinned"].items())
+        files = release.get("files", {})
+        names = ", ".join(f"{model_id} ({cls}" + ("; " + ", ".join(files[model_id]) if model_id in files else "") + ")" for model_id, cls in release["models"].items())
+        text.append(f"- {release['time_s']:.1f} s: MMGP release of {names}, "
+                    f"{release['pinned_at_release_gb']:.2f} GiB pinned at the release, **{still:.2f} GiB still pinned now**" + (f" ({detail})" if still else "")
+                    + (f"; **models still alive: {', '.join(release['alive'])}** (something still refers to them: their RAM cannot be given back)" if release["alive"] else "; no model alive")
+                    + ".\n")
+        for model_id, paths in release["alive"].items():
+            for path in paths or ["(no chain found)"]:
+                text.append(f"  - {model_id} held by: {path}\n")
+    return "".join(text) + "\n"
+
+
+def _retained_summary(retained):
+    text = ["## Exceptions, tracebacks and frames kept by globals\n\nA kept frame keeps its local variables, and through f_back its callers' frames with "
+            "theirs: a stored exception keeps the objects of the whole call stack where it was raised.\n\n"]
+    for item in retained:
+        text.append(f"- **{item['held_by']}** = {item['what']}: frames {' <- '.join(item['frames'][:12])}{' ...' if len(item['frames']) > 12 else ''}; "
+                    f"their locals: CPU tensors {item['local_cpu_tensors_gb']:.2f} GiB" + (f", modules {', '.join(item['local_modules'])}" if item["local_modules"] else "") + "\n")
+    return "".join(text) + "\n"
+
+
 def summary(result):
     """Markdown summary of a report."""
     text = [f"# RAM debug report, {result['created']}{' (' + result['label'] + ')' if result.get('label') else ''}\n\n"
             f"Peak since the previous report: private {result['peak']['private_gb']:.2f} GiB, resident {result['peak']['resident_gb']:.2f} GiB. "
             f"Allocation hooks: {result['hooks']}; threshold {result['threshold_mb']} MB.\n\n"]
+    peak = result.get("recording_peak")
+    if peak:
+        process_peak = peak["process_peak_private_gb"]
+        text.append(f"Peak of the recording: private {peak['private_gb']:.2f} GiB at {peak['time_s']:.1f} s (phase {peak['phase']}), resident {peak['resident_gb']:.2f} GiB"
+                    + ("" if process_peak is None else f"; peak private of the process since it started {process_peak:.2f} GiB"
+                       + (" (reached before the recording or between two samples)" if process_peak > peak["private_gb"] + 0.5 else ""))
+                    + ("" if peak["available_min_gb"] is None else f". System: least available RAM {peak['available_min_gb']:.1f} GiB, "
+                       f"other processes at the peak about {peak['other_processes_at_peak_gb']:.1f} GiB") + ".\n\n")
+    if result.get("ram_allocator"):
+        text.append(_allocator_summary(result["ram_allocator"]))
+    if result.get("releases"):
+        text.append(_releases_summary(result["releases"]))
+    if result.get("retained_frames"):
+        text.append(_retained_summary(result["retained_frames"]))
+    if result.get("pinned_by_owner"):
+        text.append("Pinned RAM registered now, by model: " + ", ".join(f"{owner} {item['gb']:.2f} GiB ({item['blocks']} blocks"
+                                                                       + (f", {item['pool_blocks']} of them in the pinned pool" if item.get("pool_blocks") else "")
+                                                                       + (", from " + ", ".join(item["files"]) if item.get("files") else "") + ")"
+                                                                       for owner, item in result["pinned_by_owner"].items()) + ".\n\n")
     if len(result.get("history", [])) > 1:
         text.append(_trend_summary(result["history"]))
     if result["phases"]:
@@ -1669,7 +1901,7 @@ def summary(result):
         for phase in result["phases"]:
             hooked = phase.get("hooked_at_peak")
             if hooked and hooked["groups"]:
-                pinning = [group for group in hooked["groups"] if "(mmgp _pinned_block" in group["where"] or "(mmgp _StagingRing" in group["where"]]
+                pinning = [group for group in hooked["groups"] if "(mmgp block)" in group["where"] or "(mmgp _StagingRing" in group["where"]]
                 others = [group for group in hooked["groups"] if group not in pinning]
                 note = f"; MMGP pinned weights and staging ring {sum(group['mb'] for group in pinning) / 1024:.2f} GiB, not listed" if pinning else ""
                 text.append(f"### Hooked allocations alive at the peak of {phase['name']} ({hooked['time_s']:.1f} s): PyTorch {hooked['torch_gb']:.2f} GiB, NumPy {hooked['numpy_gb']:.2f} GiB{note}\n\n"
@@ -1685,6 +1917,8 @@ def summary(result):
             text.append(f"| {origin['kind']} | {origin['count']} | {origin['total_gb']:.2f} | {origin['max_mb']:.0f} | {'-' if life is None else f'{life:.1f}'} | "
                         f"{origin['module'] or '-'} | {origin['where'] or '-'} |\n")
         text.append("\n")
+    if "events" in result:
+        text.append("## MMGP memory events since the previous report\n\n" + _events.timeline_json(result["events"]))
     text.append("Stacks (innermost frame first) are in the JSON report under `stacks`, by the `stack` id of each group.\n")
     return "".join(text)
 
@@ -1696,15 +1930,23 @@ def _trend_summary(history):
     labels = list(dict.fromkeys(label for entry in history for label in entry["classes"]))
     spans = {label: [entry["classes"].get(label, 0.0) for entry in history] for label in labels}
     changing = sorted((label for label in labels if max(spans[label]) - min(spans[label]) >= 0.1), key=lambda label: -abs(spans[label][-1] - spans[label][0]))[:6]
-    text = ["## RAM after each report since the start of the recording (GiB)\n\n| census | time (s) | private | resident | " + " | ".join(changing) + " |\n|---|---:|---:|---:|" + "---:|" * len(changing) + "\n"]
+    columns = ["census", "time (s)", "private", "resident", "memory-mapped files resident", *changing]
+    text = ["## RAM after each report since the start of the recording (GiB)\n\n| " + " | ".join(columns) + " |\n|---|" + "---:|" * (len(columns) - 1) + "\n"]
     for entry in history:
-        text.append(f"| {entry['label']} | {entry['time_s']:.0f} | {entry['private_gb']:.2f} | {entry['resident_gb']:.2f} | " + " | ".join(f"{entry['classes'].get(label, 0.0):.2f}" for label in changing) + " |\n")
+        mapped = entry.get("mapped_files_gb")
+        values = [entry["label"], f"{entry['time_s']:.0f}", f"{entry['private_gb']:.2f}", f"{entry['resident_gb']:.2f}", "-" if mapped is None else f"{mapped:.2f}",
+                  *(f"{entry['classes'].get(label, 0.0):.2f}" for label in changing)]
+        text.append("| " + " | ".join(values) + " |\n")
     text.append(f"\nChange since the start: private {last['private_gb'] - first['private_gb']:+.2f} GiB, resident {last['resident_gb'] - first['resident_gb']:+.2f} GiB.\n\n")
     previous = next((entry for entry in reversed(history[:-1]) if entry["census"] == last["census"]), None)
     if previous is None:
         return "".join(text)
-    seen = {(item["what"], item["held_by"]) for item in previous["objects"]}
-    new_objects = [item for item in last["objects"] if (item["what"], item["held_by"]) not in seen]
+    def identity(item):  # the same buffer, whatever its holders read now (older reports: by holder)
+        return (item["pointer"], item["what"]) if item.get("pointer") else (item["what"], item["held_by"])
+    seen = {identity(item) for item in previous["objects"]}
+    new_objects = [item for item in last["objects"] if identity(item) not in seen]
+    files_before = {item["file"] for item in previous.get("files", [])}
+    new_files = [item for item in last.get("files", []) if item["file"] not in files_before]
     def by_origin(entry):
         totals = {}
         for group in entry["allocations"]:
@@ -1716,8 +1958,10 @@ def _trend_summary(history):
     grown = sorted(((key, total, total["mb"] - before.get(key, {"mb": 0.0})["mb"], total["count"] - before.get(key, {"count": 0})["count"]) for key, total in now.items()), key=lambda row: -row[2])
     grown = [row for row in grown if row[2] >= 1]
     text.append(f"## Alive now and not at the previous census of this kind ({previous['label']})\n\n")
-    if not new_objects and not grown:
-        text.append("Nothing new among the largest objects and the hooked allocations.\n\n")
+    if not new_objects and not grown and not new_files:
+        text.append("Nothing new among the largest objects, the hooked allocations and the memory-mapped files.\n\n")
+    if new_files:
+        text.append("| GiB resident | newly mapped file |\n|---:|---|\n" + "".join(f"| {item['resident_gb']:.2f} | {item['file']} |\n" for item in new_files) + "\n")
     if new_objects:
         text.append("| MB | new object | memory | held by |\n|---:|---|---|---|\n" + "".join(f"| {item['mb']:.0f} | {item['what']} | {item['memory']} | {item['held_by'] or '-'} |\n" for item in new_objects) + "\n")
     if grown:

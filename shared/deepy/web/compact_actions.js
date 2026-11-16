@@ -1,3 +1,4 @@
+// Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 /* Presentation only: canonical messages and blocks remain flat and unchanged. */
 (() => {
   const WAC = window.__wangpAssistantChatNS;
@@ -293,6 +294,7 @@
   };
   WAC.applyDisplaySettings = values => {
     if (compactByDefault !== values.compact_actions) WAC.setCompactActions(values.compact_actions);
+    WAC.galleryMediaViewer = values.gallery_media_viewer;
   };
   const consume = WAC.consumePayload;
   WAC.consumePayload = function (payload) {

@@ -1,6 +1,9 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """Immutable CPU cache segments: share a stable prefix, copy only the changed tail."""
 
 import torch
+
+from mmgp import transfer
 
 
 def snapshot_cache(tensor, ranges, *, axis, previous=None, reuse=0):
@@ -20,12 +23,11 @@ def snapshot_cache(tensor, ranges, *, axis, previous=None, reuse=0):
         start += skipped
         remaining -= skipped
         if start < end:
-            saved = tensor.narrow(axis, start, end - start).detach().as_subclass(torch.Tensor).to("cpu", copy=True)
-            segments.append((start, saved))
+            segments.append((start, transfer.move(tensor.detach().as_subclass(torch.Tensor).narrow(axis, start, end - start), "cpu")))
     return {"shape": tuple(tensor.shape), "axis": axis, "segments": segments}
 
 
 def restore_cache(tensor, snapshot):
     axis = snapshot["axis"]
     for start, saved in snapshot["segments"]:
-        tensor.narrow(axis, start, saved.shape[axis]).copy_(saved)
+        transfer.copy_(tensor.narrow(axis, start, saved.shape[axis]), saved)

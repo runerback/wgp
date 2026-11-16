@@ -13,7 +13,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, Qwen2VLImageProcessorFast, Qwen2VLProcessor
 from transformers.processing_utils import ProcessorMixin
 
-from mmgp import offload
+from mmgp import offload, runtime
 from shared.utils import files_locator as fl
 from shared.utils.gguf_mapping import has_standard_gguf_tensor_names, remap_state_dict_triplet
 from shared.utils.text_encoder_cache import TextEncoderCache
@@ -181,7 +181,9 @@ class Krea2Pipeline:
         self.transformer = transformer
         self.vae = vae
         self.encoder = encoder
-        self.text_encoder_cache = TextEncoderCache()
+        # an entry keeps 12 encoder layers over the 512 padded tokens (~31 MB): the padding rows stay, as they still shape SageAttention's
+        # key quantization; the default 100 MB would hold 3 prompts
+        self.text_encoder_cache = TextEncoderCache(max_size_mb=512)
         self.dtype = dtype
         self.compression = 8
         self.channels = 16
@@ -410,7 +412,7 @@ class Krea2Pipeline:
                 image_mask_rebuilt = torch.maximum(image_mask_rebuilt, outpainting_mask_rebuilt)
             randn = x.clone()
             if model_mode_int in (2, 3, 4, 5):
-                from shared.inpainting.lanpaint import LanPaint
+                from shared.lanpaint import LanPaint
 
                 lanpaint_steps = {2: 2, 3: 5, 4: 10, 5: 15}.get(model_mode_int, 5)
                 lanpaint_proc = LanPaint(NSteps=lanpaint_steps, Lambda=16.0, StepSize=0.2, Beta=1.0, Friction=15.0, IS_FLUX=False, IS_FLOW=True, overdamped_fallback=True)
@@ -539,7 +541,7 @@ class Krea2Pipeline:
             source_pixels = self._image_to_cpu_uint8(source_image, width, height).to(decoded.device, torch.float32)
             mask_pixels = image_mask_rebuilt.to(decoded.device, torch.float32)
             if lanpaint_proc is not None:
-                from shared.inpainting.lanpaint import blend_images_with_mask
+                from shared.lanpaint import blend_images_with_mask
 
                 if outpainting_mask is not None:
                     blend_pad = 4
@@ -668,7 +670,7 @@ def _build_krea2_text_encoder_preprocessor(text_config):
     return preprocess_state_dict
 
 
-def _load_text_encoder(text_encoder_filename, config_path, dtype, with_vision=False, vision_encoder_filename=None):
+def _load_text_encoder(text_encoder_filename, config_path, dtype, with_vision=False):
     register_qwen3_vl_config()
     config = Qwen3VLConfig.from_json_file(config_path)
     with init_empty_weights(include_buffers=True):
@@ -683,12 +685,11 @@ def _load_text_encoder(text_encoder_filename, config_path, dtype, with_vision=Fa
         default_dtype=dtype,
         preprocess_sd=_build_krea2_text_encoder_preprocessor(config.text_config),
     )
-    if with_vision:
-        if vision_encoder_filename is None:
-            raise ValueError("Krea2 edit requires a standalone Qwen3-VL vision encoder checkpoint.")
+    runtime.lookup_on_cpu(text_encoder.language_model.embed_tokens)  # the 0.7 GB token table stays in RAM: mmgp looks up the prompt's rows on the CPU
+    if with_vision:  # the shared checkpoint holds the vision tower beside the language model
         offload.load_model_data(
             text_encoder.visual,
-            vision_encoder_filename,
+            text_encoder_filename,
             modelPrefix="visual",
             writable_tensors=False,
             default_dtype=dtype,
@@ -724,22 +725,13 @@ class model_factory:
         text_encoder_folder = model_def["text_encoder_folder"]
         text_encoder_config_path = fl.locate_file(os.path.join(text_encoder_folder, "config.json"))
         edit = base_model_type in ("krea2_raw_edit", "krea2_turbo_edit")
-        vision_encoder_filename = None
-        if edit:
-            vision_encoder_filename = fl.locate_file(model_def["vision_encoder_filename"])
-        text_encoder = _load_text_encoder(
-            text_encoder_filename,
-            text_encoder_config_path,
-            dtype,
-            with_vision=edit,
-            vision_encoder_filename=vision_encoder_filename,
-        )
+        text_encoder = _load_text_encoder(text_encoder_filename, text_encoder_config_path, dtype, with_vision=edit)
         tokenizer_config = fl.locate_file(os.path.join(text_encoder_folder, "tokenizer_config.json"))
         fl.locate_file(os.path.join(text_encoder_folder, "tokenizer.json"))
         fl.locate_file(os.path.join(text_encoder_folder, "chat_template.jinja"))
         tokenizer_path = os.path.dirname(tokenizer_config)
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, max_length=512, trust_remote_code=True, extra_special_tokens={})
-        image_processor = Qwen2VLImageProcessorFast.from_pretrained(tokenizer_path)
+        image_processor = Qwen2VLImageProcessorFast.from_pretrained(fl.locate_file(os.path.join(text_encoder_folder, "preprocessor_config.json")))  # located per file: a same-named folder in another checkpoint root must not shadow it
         processor = Krea2Qwen3VLProcessor(image_processor, tokenizer)
         vae = load_vae(model_def, VAE_upsampling)
         self.pipeline = Krea2Pipeline(transformer, vae, Qwen3VLConditioner(text_encoder, tokenizer, processor), dtype=dtype)

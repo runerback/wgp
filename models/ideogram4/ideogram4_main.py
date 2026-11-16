@@ -10,7 +10,7 @@ from transformers import AutoTokenizer
 from transformers.masking_utils import create_causal_mask
 from tqdm import tqdm
 
-from mmgp import offload
+from mmgp import offload, runtime
 from shared.utils import files_locator as fl
 
 from models.flux.modules.autoencoder_flux2 import AutoencoderKLFlux2, AutoEncoderParamsFlux2
@@ -135,6 +135,7 @@ def _load_text_encoder(filename: str, config_path: str, dtype: torch.dtype) -> I
         text_encoder = Ideogram4TextEncoder(config)
     text_encoder.language_model.rotary_emb.reset_inv_freq()
     offload.load_model_data(text_encoder.language_model, filename, modelPrefix="language_model", writable_tensors=False, default_dtype=dtype)
+    runtime.lookup_on_cpu(text_encoder.language_model.embed_tokens)  # the 1.2 GB token table stays in RAM: mmgp looks up the prompt's rows on the CPU
     text_encoder.eval().requires_grad_(False)
     return text_encoder
 
@@ -223,7 +224,8 @@ class Ideogram4WanPipeline:
             "token_ids": token_ids.to(device),
             "text_position_ids": text_position_ids.to(device),
             "position_ids": position_ids.to(device),
-            "segment_ids": segment_ids.to(device),
+            # a key mask only with padding (prompts of different lengths): all True otherwise, and attention without a mask is faster
+            "segment_ids": segment_ids.to(device) if (segment_ids == SEQUENCE_PADDING_INDICATOR).any() else None,
             "indicator": indicator.to(device),
             "num_image_tokens": num_image_tokens,
             "grid_h": grid_h,
@@ -392,7 +394,7 @@ class Ideogram4WanPipeline:
 
         if self.unconditional_transformer is not None:
             neg_position_ids = inputs["position_ids"][:, max_text_tokens:]
-            neg_segment_ids = inputs["segment_ids"][:, max_text_tokens:]
+            neg_segment_ids = None  # image tokens are never padded
             neg_indicator = inputs["indicator"][:, max_text_tokens:]
             neg_llm_features = llm_features.new_empty(batch_size, 0, llm_features.shape[-1])
 

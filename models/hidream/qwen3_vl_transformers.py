@@ -18,6 +18,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified for WanGP.
 import os
 from dataclasses import dataclass
 from typing import Any, Optional, Union
@@ -1894,6 +1895,9 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
         self.post_init()
+        # These hold no weights themselves: their locks keep MMGP from rounding the float32 timestep to BF16 before t_embedder1's
+        # `t * 1000` and FP32 sinusoid, as the joint path (arguments in lists) already did; the pipeline passes BF16 latents and image embeds
+        self.model._lock_dtype = self._lock_dtype = torch.float32
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()

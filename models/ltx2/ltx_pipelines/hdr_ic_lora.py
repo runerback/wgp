@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 Lightricks. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified for WanGP.
 """LTX-2.5 SDR-to-HDR IC-LoRA conversion.
 
 The SDR clip is moved to the ACEScct working space and appended as a frozen full-length reference. Every segment
@@ -71,6 +72,7 @@ def convert_sdr_to_hdr(
     callback: Callable[..., None] | None = None,
     set_progress_status: Callable[[str], None] | None = None,
     interrupt_check: Callable[[], bool] | None = None,
+    custom_sigmas=None,
 ) -> torch.Tensor | None:
     """Convert an SDR control video ``(C, F, H, W)`` in [-1, 1] into scene-linear Rec.709 frames ``(F, H, W, 3)``.
 
@@ -101,6 +103,8 @@ def convert_sdr_to_hdr(
         return None
 
     sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
+    if custom_sigmas and custom_sigmas[0] is not None:
+        sigmas = torch.tensor([*custom_sigmas[0], 0.0], device=device, dtype=torch.float32)
     bind_interrupt_check(transformer, interrupt_check)
     if loras_slists is not None:
         steps = len(sigmas) - 1

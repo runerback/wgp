@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from typing import List, Tuple, Dict, Callable
 
 
@@ -7,9 +8,9 @@ def preparse_loras_multipliers(loras_multipliers):
 
     loras_multipliers = loras_multipliers.strip(" \r\n")
     loras_mult_choices_list = loras_multipliers.replace("\r", "").split("\n")
-    loras_mult_choices_list = [multi.strip() for multi in loras_mult_choices_list if len(multi)>0 and not multi.startswith("#")]
+    loras_mult_choices_list = [multi.strip() for multi in loras_mult_choices_list if multi.strip() and not multi.lstrip().startswith("#")]
     loras_multipliers = " ".join(loras_mult_choices_list)
-    return loras_multipliers.replace("|"," ").strip().split(" ")
+    return loras_multipliers.replace("|"," ").split()
 
 def expand_slist(slists_dict, mult_no, num_inference_steps, model_switch_step, model_switch_step2 ):
     def expand_one(slist, num_inference_steps):
@@ -39,9 +40,9 @@ def _new_slists_dict(nb_loras):
 
 
 def parse_loras_multipliers(loras_multipliers, nb_loras, num_inference_steps, merge_slist = None, nb_phases = 2, model_switch_step = None, model_switch_step2 = None, model_switch_phase = 1, lora_multiplier_branches = None):
-    if "|" in loras_multipliers: 
-        pos = loras_multipliers.find("|")
-        if "|" in  loras_multipliers[pos+1:]: return "", "", "There can be only one '|' character in Loras Multipliers Sequence"
+    if isinstance(loras_multipliers, str):
+        pos = _find_bar(loras_multipliers)
+        if pos >= 0 and _find_bar(loras_multipliers[pos + 1:]) >= 0: return "", "", "There can be only one '|' character in Loras Multipliers Sequence"
 
     if model_switch_step is None:
         model_switch_step = num_inference_steps
@@ -330,8 +331,8 @@ def merge_loras_settings(
 ) -> Tuple[List[str], str]:
     """
     Merge settings with full formatting/comment preservation and correct handling of `mult_new` with '|'.
-    Dedup rule: when merging AFTER (resp. BEFORE), if a new lora already exists in preserved BEFORE (resp. AFTER),
-    update that preserved multiplier and drop the duplicate from the replaced side.
+    Accelerator entries belong BEFORE: merging BEFORE moves matching entries out of AFTER;
+    merging AFTER updates matching BEFORE multipliers without duplicating or moving their entries.
     """
     assert mode in ("merge before", "merge after")
     mult_old= mult_old.strip()
@@ -387,27 +388,13 @@ def merge_loras_settings(
         loras_out   = preserved_loras + loras_keep
 
     else:
-        # Preserve AFTER; replace BEFORE (with dedupe/update)
+        # Replace BEFORE, moving matching AFTER entries into the accelerator set.
         preserved_loras = loras_old[keep_b:]
-        preserved_text  = after_old_aligned
-        preserved_spans = _spans(preserved_text)
-        pos_by_key: Dict[str, int] = {}
-        for i, lp in enumerate(preserved_loras):
-            k = path_key(lp)
-            if k not in pos_by_key: pos_by_key[k] = i
-
-        repl_map: Dict[int, str] = {}
-        drop_idxs: List[int] = []
-        for i, lp in enumerate(loras_new_sel):
-            j = pos_by_key.get(path_key(lp))
-            if j is not None and j < len(preserved_spans):
-                repl_map[j] = new_tokens[i] if i < len(new_tokens) else "1"
-                drop_idxs.append(i)
-
-        after_text  = _replace_tokens(preserved_text, repl_map)
-        before_text = _drop_tokens_by_indices(mult_new_aligned, drop_idxs)
-        loras_keep  = [lp for i, lp in enumerate(loras_new_sel) if i not in set(drop_idxs)]
-        loras_out   = loras_keep + preserved_loras
+        new_keys = {path_key(lp) for lp in loras_new_sel}
+        drop_idxs = [i for i, lp in enumerate(preserved_loras) if path_key(lp) in new_keys]
+        after_text = _drop_tokens_by_indices(after_old_aligned, drop_idxs)
+        before_text = mult_new_aligned
+        loras_out = loras_new_sel + [lp for lp in preserved_loras if path_key(lp) not in new_keys]
 
     # Compose, preserving explicit "before-only" bar when appropriate
     has_before = len(_spans(before_text)) > 0

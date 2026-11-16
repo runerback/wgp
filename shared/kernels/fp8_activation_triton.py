@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """Per-tensor FP8 activation quantization in two kernels, bit-identical to the PyTorch path of shared.qtypes.scaled_fp8."""
 import numpy as np
 import torch
@@ -29,7 +30,7 @@ def _quantize_kernel(x_ptr, q_ptr, partial_ptr, scale_ptr, n, inv_maxv, maxv, mi
     if pid == 0:
         tl.store(scale_ptr, scale)
     scale_x = scale.to(X_DTYPE).to(tl.float32)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)  # 64 bits: tensors of 2^31 elements and more
     mask = offs < n
     x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     y = tl.math.div_rn(x, scale_x).to(X_DTYPE).to(tl.float32)  # x / scale computed in float32 and rounded to x's dtype, as torch does
@@ -41,15 +42,20 @@ def supports(x, fp8_dtype):
             and x.dtype in _TL_FLOAT and fp8_dtype in _TL_FP8 and x.is_contiguous() and 0 < x.numel() < 2**31)
 
 
-def quantize_activation(x, fp8_dtype, minv, maxv):
-    n = x.numel()
+def absmax_partials(x):
+    """Partial absmax results of x: the scale of the whole tensor for quantize, also called on slices of its rows."""
     partials = torch.empty(PARTIALS, device=x.device, dtype=torch.float32)
-    _absmax_partials_kernel[(PARTIALS,)](x, partials, n, BLOCK=BLOCK, PARTS=PARTIALS)
+    _absmax_partials_kernel[(PARTIALS,)](x, partials, x.numel(), BLOCK=BLOCK, PARTS=PARTIALS)
+    return partials
+
+
+def quantize(x, partials, scale, fp8_dtype, minv, maxv):
+    """x (contiguous) in FP8 with the scale of the absmax partials, which it writes to scale."""
+    n = x.numel()
     q = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
-    scale = torch.empty((), device=x.device, dtype=torch.float32)
     inv_maxv = float(np.float32(1.0) / np.float32(maxv))
     _quantize_kernel[(triton.cdiv(n, BLOCK),)](x, q, partials, scale, n, inv_maxv, float(maxv), float(minv), X_DTYPE=_TL_FLOAT[x.dtype], Q_DTYPE=_TL_FP8[fp8_dtype], BLOCK=BLOCK, PARTS=PARTIALS)
-    return q, scale
+    return q
 
 
 from shared.kernels.triton_compilation_log import install_triton_compilation_logger

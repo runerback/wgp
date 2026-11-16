@@ -1,3 +1,6 @@
+# Adapted from HunyuanVideo (https://github.com/Tencent-Hunyuan/HunyuanVideo), Copyright (C) Tencent, Tencent Hunyuan
+# Community License Agreement (https://github.com/Tencent-Hunyuan/HunyuanVideo/blob/main/LICENSE.txt). Modified for WanGP.
+# Modifications Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from typing import Any, List, Tuple, Optional, Union, Dict
 from einops import rearrange
 
@@ -202,9 +205,6 @@ class MMDoubleStreamBlock(nn.Module):
             txt_mod2_gate,
         ) = self.txt_mod(vec).chunk(6, dim=-1)
 
-        ##### Enjoy this spagheti VRAM optimizations done by DeepBeepMeep !
-        # I am sure you are a nice person and as you copy this code, you will give me officially proper credits:
-        # Please link to https://github.com/deepbeepmeep/HunyuanVideoGP and @deepbeepmeep on twitter  
 
         # Prepare image for attention.
         img_modulated = self.img_norm1(img)
@@ -406,9 +406,6 @@ class MMSingleStreamBlock(nn.Module):
         frist_frame_token_num: int = None,        
     ) -> torch.Tensor:
 
-        ##### More spagheti VRAM optimizations done by DeepBeepMeep !
-        # I am sure you are a nice person and as you copy this code, you will give me proper credits:
-        # Please link to https://github.com/deepbeepmeep/Wan2GP and @deepbeepmeep on twitter  
 
         if condition_type == "token_replace":
             mod, tr_mod = self.modulation(vec,
@@ -837,8 +834,10 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         layer_list = [self.final_layer, self.final_layer.linear, self.final_layer.adaLN_modulation[1]]
         for layer in layer_list:
             layer._lock_dtype = dtype
-
-        self._lock_dtype = dtype
+        # These hold no weights themselves: their FP32 locks keep MMGP from rounding the float32 timesteps / guidance to BF16 before their sinusoids
+        for module in (self, self.time_in, self.txt_in, self.guidance_in, self.time_r_in):
+            if module is not None:
+                module._lock_dtype = torch.float32
 
     def enable_deterministic(self):
         for block in self.double_blocks:

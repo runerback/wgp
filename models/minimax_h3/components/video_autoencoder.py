@@ -11,12 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from mmgp import transfer
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention import AttentionMixin
@@ -26,28 +28,15 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import logging
 from diffusers.utils.accelerate_utils import apply_forward_hook
 
-from shared.attention import pay_attention, triton_installed, major, minor
+from shared import attention_kit
+from shared.attention import pay_attention
 
 from ..interrupt import GenerationInterrupted
 from shared.utils.phase_progress import vae_encoding_progress, PhaseProgress
-from . import vae_kitchen
-from shared.kernels import kernel_policy, int8_backend
-
+from shared.kernels import ops as kernels, vae_ops
 
 logger = logging.get_logger(__name__)
-
-# Enable only on the architecture validated with real H3 checkpoints. Other
-# devices retain the established PyTorch implementation.
-USE_TRITON_VAE = triton_installed and (major, minor) == (12, 0)
-USE_KITCHEN_VAE = True
-# Kitchen INT8 fusions validated for this decoder with BF16 and FP16 activations.
 _FUSED_DTYPES = (torch.bfloat16, torch.float16)
-if USE_TRITON_VAE:
-    from . import vae_kernels
-
-
-def _use_triton_vae(x):
-    return USE_TRITON_VAE and x.is_cuda and x.dtype == torch.bfloat16 and torch.is_inference_mode_enabled()
 
 
 class MiniMaxH3VideoCausalConv3d(nn.Conv3d):
@@ -81,10 +70,8 @@ class MiniMaxH3VideoCausalConv3d(nn.Conv3d):
             )
         if self.temporal_padding > 0 and not pre_padded:
             hidden_states = F.pad(hidden_states, (0, 0, 0, 0, self.temporal_padding, 0), mode="constant")
-        if USE_KITCHEN_VAE and vae_kitchen.can_conv3d(hidden_states, self):
-            return vae_kitchen.conv3d(hidden_states, self, residual)
-        hidden_states = F.conv3d(hidden_states, self.weight, self.bias, stride=self.stride, padding=0, dilation=self.dilation)
-        return hidden_states if residual is None else hidden_states.add_(residual)
+        x_list, hidden_states = [hidden_states], None
+        return vae_ops.conv3d(x_list, self, residual)
 
 
 class MiniMaxH3VideoGroupNorm(nn.GroupNorm):
@@ -94,24 +81,8 @@ class MiniMaxH3VideoGroupNorm(nn.GroupNorm):
     """
 
     def forward(self, hidden_states: torch.Tensor, *, silu_pad=None) -> torch.Tensor:
-        if silu_pad is not None and USE_KITCHEN_VAE and vae_kitchen.available(hidden_states, self, silu_pad):
-            return vae_kitchen.group_norm_silu_pad3d(hidden_states, self, silu_pad)
-        batch_size, num_channels, num_frames, height, width = hidden_states.shape
-        hidden_states = hidden_states.permute(0, 2, 1, 3, 4).contiguous()
-        hidden_states = hidden_states.view(batch_size * num_frames, num_channels, 1, height, width)
-        hidden_states = super().forward(hidden_states)
-        if silu_pad is not None and _use_triton_vae(hidden_states):
-            left, right, top, bottom, front = silu_pad
-            if left == right == top == bottom and left < min(height, width):
-                return vae_kernels.silu_pad_frames(hidden_states, batch_size, num_frames, left, front)
-        hidden_states = hidden_states.view(batch_size, num_frames, num_channels, height, width)
-        hidden_states = hidden_states.permute(0, 2, 1, 3, 4).contiguous()
-        if silu_pad is not None:
-            left, right, top, bottom, front = silu_pad
-            hidden_states = F.silu(hidden_states)
-            hidden_states = F.pad(hidden_states, (left, right, top, bottom, 0, 0), mode="reflect")
-            hidden_states = F.pad(hidden_states, (0, 0, 0, 0, front, 0))
-        return hidden_states
+        x_list, hidden_states = [hidden_states], None
+        return vae_ops.frame_group_norm(x_list, self, silu_pad)
 
 
 def _norm_silu_conv(hidden_states: list[torch.Tensor], norm, conv, residual=None):
@@ -204,7 +175,10 @@ class MiniMaxH3VideoDownsample3d(nn.Module):
         if self.spatial_padding_mode != "reflect":
             return self.conv(F.pad(hidden_states, (0, 1, 0, 1, 0, 0), mode=self.spatial_padding_mode))
         front, (height, width) = self.conv.temporal_padding, hidden_states.shape[-2:]
-        padded = hidden_states.new_empty((*hidden_states.shape[:2], front + hidden_states.shape[2], height + 1, width + 1))
+        # channels-last activations (fused convolutions) keep their layout: the copies stay coalesced and the convolution reads the buffer as is
+        layout = torch.channels_last_3d if hidden_states.is_contiguous(memory_format=torch.channels_last_3d) else torch.contiguous_format
+        padded = torch.empty((*hidden_states.shape[:2], front + hidden_states.shape[2], height + 1, width + 1), dtype=hidden_states.dtype,
+                             device=hidden_states.device, memory_format=layout)
         padded[:, :, :front].zero_()
         frames = padded[:, :, front:]
         frames[..., :height, :width].copy_(hidden_states)
@@ -348,7 +322,7 @@ class MiniMaxH3VideoRotaryPosEmbed(nn.Module):
     def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         angles = 2.0 * math.pi * position_ids[:, :, :, None] * self.inv_freq[None, None, None, :]
         angles = angles.flatten(2, 3).tile(2).unsqueeze(2)
-        return vae_kitchen.prepare_rotary(angles.cos(), angles.sin())
+        return vae_ops.prepare_rotary(angles.cos(), angles.sin())
 
 
 def _take(x_list: list[torch.Tensor]) -> torch.Tensor:
@@ -357,24 +331,45 @@ def _take(x_list: list[torch.Tensor]) -> torch.Tensor:
     return hidden_states
 
 
-def _split_interleaved_qkv(src, dim, split_sizes, context):
-    info = context["info"]
-    heads, head_dim = info["num_attention_heads"], info["attention_head_dim"]
-    grouped = src.reshape(heads, 3, head_dim, *src.shape[1:])
-    return [grouped[:, index].reshape(split_sizes[index], *src.shape[1:]).contiguous() for index in range(3)]
+def group_qkv_rows(state_dict, num_attention_heads: int = 32, attention_head_dim: int = 64):
+    """The rows of the fused to_qkv projections (weights, the per-row scales of INT8 checkpoints, biases), interleaved head by head
+    (heads, q/k/v, head_dim) in the released checkpoints, grouped (q/k/v, heads, head_dim): MMGP then splits them into to_q / to_k / to_v
+    as row ranges, quantized or not."""
+    rows = 3 * num_attention_heads * attention_head_dim
+    for key in [key for key in state_dict if key.endswith((".attn.to_qkv.weight", ".attn.to_qkv.weight_scale", ".attn.to_qkv.bias"))]:
+        tensor = state_dict[key]
+        if tensor.shape[0] == rows:  # a per-tensor scale stays as it is
+            state_dict[key] = tensor.reshape(num_attention_heads, 3, attention_head_dim, *tensor.shape[1:]).transpose(0, 1).reshape(tensor.shape).contiguous()
+    return state_dict
 
 
-def get_linear_split_map(inner_dim: int = 2048, num_attention_heads: int = 32,
-                         attention_head_dim: int = 64):
-    return {
-        "to_qkv": {
-            "mapped_modules": ["to_q", "to_k", "to_v"],
-            "split_sizes": [inner_dim, inner_dim, inner_dim],
-            "num_attention_heads": num_attention_heads,
-            "attention_head_dim": attention_head_dim,
-            "split_handlers": {"weight": _split_interleaved_qkv, "bias": _split_interleaved_qkv},
-        }
-    }
+def get_linear_split_map(inner_dim: int = 2048):
+    return {"to_qkv": {"mapped_modules": ["to_q", "to_k", "to_v"], "split_sizes": [inner_dim, inner_dim, inner_dim]}}
+
+
+def _rotate_(x, rotary, first, last):
+    """The split-half RoPE of the first rotary channels of FP32 rows x (batch, tokens first..last, heads, head_dim), in place."""
+    cos, sin = (table[:, first:last] for table in rotary)
+    half = cos.shape[-1] // 2
+    a, b = x[..., :half], x[..., half:2 * half]
+    rotated = a * cos[..., :half] - b * sin[..., :half]
+    b.mul_(cos[..., half:]).add_(a * sin[..., half:])
+    a.copy_(rotated)
+    return x
+
+
+def _norm_rope_(query, key, attn, rotary_emb, plan):
+    """In place on query and / or key (batch, tokens, heads, head_dim; the other None): the per-head RMSNorm without weight then the
+    split-half RoPE of the first rotary channels. Both together go through the fused kernel of rope_plan when there is one; alone (the
+    staged quantization projects k before q), FP32 rows rounded once."""
+    if query is not None and key is not None and plan[0] is not None:
+        for x, done in zip((query, key), vae_ops.finish_rope_(query, key, rotary_emb, attn.norm_q.eps, plan)):
+            if done is not x:
+                x.copy_(done)
+        return
+    for x, norm in ((query, attn.norm_q), (key, attn.norm_k)):
+        if x is not None:
+            attention_kit.rows_(x, lambda part, first, last: (norm(part.float()) if rotary_emb is None else _rotate_(norm(part.float()), rotary_emb, first, last)).to(x.dtype))
 
 
 class MiniMaxH3VideoAttnProcessor:
@@ -389,62 +384,66 @@ class MiniMaxH3VideoAttnProcessor:
         pre_norm=None, residual_scale=None,
     ) -> torch.Tensor:
         hidden_states = _take(hidden_states)
+        if hasattr(attn, "to_q") and hidden_states.dtype in _FUSED_DTYPES:
+            return self._kit_attention(attn, hidden_states, rotary_emb, pre_norm, residual_scale)
         batch_size, seq_len, _ = hidden_states.shape
-        fused = _use_triton_vae(hidden_states)
-        kitchen_rms = USE_KITCHEN_VAE and vae_kitchen.can_fuse_rms_rope(hidden_states, rotary_emb)
+        plan = vae_ops.rope_plan(hidden_states, attn.dim_head, rotary_emb)
 
         def normalize(projected, norm):
-            if kitchen_rms:
-                return projected
-            dtype = projected.dtype
-            normalized = norm(projected.float())
-            return vae_kernels.cast_rope(normalized, rotary_emb) if fused else normalized.to(dtype)
+            x_list, projected = [projected], None
+            return vae_ops.normalize_projection(x_list, norm, rotary_emb, plan)
 
         if hasattr(attn, "to_q"):
             query = normalize(attn.to_q(hidden_states).view(batch_size, seq_len, attn.heads, attn.dim_head), attn.norm_q)
             key = normalize(attn.to_k(hidden_states).view(batch_size, seq_len, attn.heads, attn.dim_head), attn.norm_k)
             value = attn.to_v(hidden_states).view(batch_size, seq_len, attn.heads, attn.dim_head)
         else:
-            qkv = (int8_backend.linear_with_fusion(attn.to_qkv, hidden_states, input_act="rms_norm", act_weight=pre_norm.weight, act_eps=pre_norm.eps)
+            qkv = (kernels.linear(attn.to_qkv, [hidden_states], input_act="rms_norm", act_weight=pre_norm.weight, act_eps=pre_norm.eps)
                    if pre_norm is not None else attn.to_qkv(hidden_states))
             qkv = qkv.view(batch_size, seq_len, attn.heads, 3, attn.dim_head)
-            query, key, value = qkv.unbind(dim=3)
+            query, key, value = qkv.unbind(dim=3)  # strided views of the head-interleaved projection: no copy
             query = normalize(query, attn.norm_q)
             key = normalize(key, attn.norm_k)
-            value = value.clone()
             del qkv
-        if kitchen_rms:
-            query, key = vae_kitchen.rms_rope(query, key, rotary_emb, attn.norm_q.eps)
+        query, key = vae_ops.finish_rope_(query, key, rotary_emb, attn.norm_q.eps, plan)
         residual = hidden_states if pre_norm is not None else None
         del hidden_states
-
-        if not fused and not kitchen_rms and rotary_emb is not None:
-            cos, sin = rotary_emb
-            cos, sin = cos.to(query.dtype), sin.to(query.dtype)
-            rotary_dim = cos.shape[-1]
-            query_rotary = query[..., :rotary_dim]
-            key_rotary = key[..., :rotary_dim]
-            query_first, query_second = query_rotary.chunk(2, dim=-1)
-            key_first, key_second = key_rotary.chunk(2, dim=-1)
-            half = query_first.shape[-1]
-            query_first_out = query_first * cos[..., :half] - query_second * sin[..., :half]
-            query_second_out = query_second * cos[..., half:] + query_first * sin[..., half:]
-            key_first_out = key_first * cos[..., :half] - key_second * sin[..., :half]
-            key_second_out = key_second * cos[..., half:] + key_first * sin[..., half:]
-            query_first.copy_(query_first_out)
-            query_second.copy_(query_second_out)
-            key_first.copy_(key_first_out)
-            key_second.copy_(key_second_out)
-            del query_first_out, query_second_out, key_first_out, key_second_out
 
         output_dtype = query.dtype
         if output_dtype == torch.float32:
             query, key, value = query.half(), key.half(), value.half()
-        hidden_states = pay_attention([query, key, value], causal=False, recycle_q=True)
+        # a strided query (view of the fused projection) gets a new contiguous output, which the output projection reads without a copy;
+        # handed off, the projection is released once quantized, before that output is allocated
+        qkv_list, recycle_q = [query, key, value], query.is_contiguous()
+        query = key = value = None
+        hidden_states = pay_attention(qkv_list, causal=False, recycle_q=recycle_q)
         projected = hidden_states.flatten(2, 3).to(output_dtype)
+        del hidden_states
         if residual is not None:
-            return int8_backend.linear_with_fusion(attn.to_out, projected, residual=residual, residual_scale=residual_scale)
+            projected_list, projected = [projected], None
+            return kernels.linear(attn.to_out, projected_list, residual=residual, residual_scale=residual_scale)
         return attn.to_out(projected)
+
+    @staticmethod
+    def _kit_attention(attn, hidden_states, rotary_emb, pre_norm, residual_scale):
+        """q, k and v projected one after the other from one prepared input (attention_kit): with SageAttention 2 staged, each is
+        quantized as soon as it is projected, the per-head norm and the RoPE of q and k fused with their quantization. The fused
+        projection's whole output (three times the input) never exists."""
+        residual = hidden_states if pre_norm is not None else None
+        x = pre_norm(hidden_states) if pre_norm is not None else hidden_states
+        del hidden_states
+        plan = vae_ops.rope_plan(x, attn.dim_head, rotary_emb)
+        # the fused kernels take the rotation as (batch, tokens, 1, pairs, cos / sin) and a weight for the norm: 1 (this one has none)
+        table = None if rotary_emb is None else torch.stack((rotary_emb[0][..., :rotary_emb[0].shape[-1] // 2], rotary_emb[1][..., :rotary_emb[1].shape[-1] // 2]), dim=-1)
+        unit = (torch.ones(attn.dim_head, dtype=x.dtype, device=x.device), attn.norm_q.eps)
+        x_list, x = [x], None
+        attention = attention_kit.qkv_attention(x_list, attn.to_q, attn.to_k, attn.to_v, attn.heads, attn.dim_head,
+                                                lambda query, key, group: _norm_rope_(query, key, attn, rotary_emb, plan),
+                                                fused_quant=lambda query, key, group, core, settings: kernels.split_half_norm_rope_quant_(query, key, table, unit, unit, core, settings))
+        projected_list, attention = [attention.flatten(2, 3)], None
+        if residual is not None:
+            return kernels.linear(attn.to_out, projected_list, residual=residual, residual_scale=residual_scale)
+        return attn.to_out(_take(projected_list))
 
 
 class MiniMaxH3VideoAttention(nn.Module):
@@ -483,33 +482,24 @@ class MiniMaxH3VideoFeedForward(nn.Module):
         hidden_states = _take(hidden_states)
         expanded = self.w1(hidden_states)
         del hidden_states
-        if _use_triton_vae(expanded):
-            gate = (vae_kernels.swiglu(expanded) if kernel_policy.allow_approximate()
-                    else vae_kernels.swiglu_(expanded))
-        else:
-            gate, value = expanded.chunk(2, dim=-1)
-            F.silu(gate, inplace=True).mul_(value)
-            del value
-        del expanded
+        x_list, expanded = [expanded], None
+        gate = vae_ops.swiglu(x_list)
         return self.w2(gate)
 
     def forward(self, hidden_states: list[torch.Tensor], pre_norm=None, residual_scale=None) -> torch.Tensor:
         hidden_states = _take(hidden_states)
-        chunk_size = max(1, hidden_states.shape[1] * hidden_states.shape[2] // self.w1.out_features)
-        if pre_norm is not None:
-            for start in range(0, hidden_states.shape[1], chunk_size):
-                x = hidden_states[:, start:start + chunk_size]
-                expanded = int8_backend.linear_with_fusion(self.w1, x, input_act="rms_norm", act_weight=pre_norm.weight, act_eps=pre_norm.eps)
-                output = int8_backend.linear_with_fusion(self.w2, expanded, input_act="swiglu", residual=x, residual_scale=residual_scale)
-                x.copy_(output)
-                del expanded, output
-            return hidden_states
-        if hidden_states.shape[1] <= chunk_size:
-            return self._project([hidden_states])
-        for start in range(0, hidden_states.shape[1], chunk_size):
-            output = self._project([hidden_states[:, start : start + chunk_size]])
-            hidden_states[:, start : start + output.shape[1]].copy_(output)
-            del output
+        # chunks of whole rows of the flattened tokens (contiguous: no input or residual copies, linears with their bias fused), each
+        # expanded projection about as large as the input; the output overwrites its own rows
+        rows = hidden_states.view(-1, hidden_states.shape[-1])
+        chunk_rows = max(1, rows.numel() // self.w1.out_features)
+        for start in range(0, rows.shape[0], chunk_rows):
+            x = rows[start:start + chunk_rows]
+            if pre_norm is None:
+                x.copy_(self._project([x]))
+                continue
+            expanded = kernels.linear(self.w1, [x], input_act="rms_norm", act_weight=pre_norm.weight, act_eps=pre_norm.eps)
+            expanded_list, expanded = [expanded], None
+            kernels.linear(self.w2, expanded_list, input_act="swiglu", residual=x, residual_scale=residual_scale, out=x)
         return hidden_states
 
 
@@ -535,27 +525,26 @@ class MiniMaxH3VideoTransformerBlock(nn.Module):
         self, hidden_states: list[torch.Tensor], rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None
     ) -> torch.Tensor:
         hidden_states = _take(hidden_states)
-        if (hasattr(self.attn, 'to_qkv')
-                and all(int8_backend.can_fuse_linear(layer, hidden_states, dtypes=_FUSED_DTYPES)
-                        for layer in (self.attn.to_qkv, self.attn.to_out, self.ff.w1, self.ff.w2))
+        # split q / k / v projections (attention kit) take the normalized input; a fused one gets the norm fused into its kernel
+        fused_qkv = (self.attn.to_qkv,) if hasattr(self.attn, 'to_qkv') else ()
+        if (all(kernels.can_linear(layer, hidden_states, dtypes=_FUSED_DTYPES)
+                for layer in (*fused_qkv, self.attn.to_out, self.ff.w1, self.ff.w2))
                 and all(p.device == hidden_states.device and p.dtype == hidden_states.dtype
                         for p in (self.norm1.weight, self.norm2.weight, self.scale1, self.scale2))):
             hidden_states = self.attn([hidden_states], rotary_emb, pre_norm=self.norm1, residual_scale=self.scale1)
             return self.ff([hidden_states], pre_norm=self.norm2, residual_scale=self.scale2)
         norm_hidden_states = self.norm1(hidden_states.to(self.norm1.weight.dtype)).to(hidden_states.dtype)
-        branch = self.attn([norm_hidden_states], rotary_emb)
-        if _use_triton_vae(branch):
-            vae_kernels.residual_(branch, self.scale1, hidden_states)
-        else:
-            branch.mul_(self.scale1).add_(hidden_states)
+        normalized_list, norm_hidden_states = [norm_hidden_states], None
+        branch = self.attn(normalized_list, rotary_emb)
+        branch_list, branch = [branch], None
+        branch = vae_ops.scaled_residual(branch_list, self.scale1, hidden_states)
         del hidden_states
         hidden_states = branch
         norm_hidden_states = self.norm2(hidden_states.to(self.norm2.weight.dtype)).to(hidden_states.dtype)
-        branch = self.ff([norm_hidden_states])
-        if _use_triton_vae(branch):
-            vae_kernels.residual_(branch, self.scale2, hidden_states)
-        else:
-            branch.mul_(self.scale2).add_(hidden_states)
+        normalized_list, norm_hidden_states = [norm_hidden_states], None
+        branch = self.ff(normalized_list)
+        branch_list, branch = [branch], None
+        branch = vae_ops.scaled_residual(branch_list, self.scale2, hidden_states)
         del hidden_states
         return branch
 
@@ -581,6 +570,7 @@ class MiniMaxH3VideoViTDecoder3d(nn.Module):
         rope_theta: float = 100.0,
         rope_dim_ratio: float = 0.75,
         norm_eps: float = 1e-5,
+        rope_axes: int = 3,
     ) -> None:
         super().__init__()
         dim = num_attention_heads * attention_head_dim
@@ -588,11 +578,13 @@ class MiniMaxH3VideoViTDecoder3d(nn.Module):
         self.patch_size_t = patch_size_t
         self.out_channels = out_channels
         self.num_register_tokens = num_register_tokens
+        self.rope_axes = rope_axes  # 2: MiniMax-H3-Image's decoder, (h, w) coordinates only
 
-        self.rope = MiniMaxH3VideoRotaryPosEmbed(int(attention_head_dim * rope_dim_ratio), theta=rope_theta)
+        self.rope = MiniMaxH3VideoRotaryPosEmbed(int(attention_head_dim * rope_dim_ratio), theta=rope_theta, num_axes=rope_axes)
         self.x_embedder = nn.Linear(in_channels, dim)
         self.register_tokens = nn.Parameter(torch.zeros(1, num_register_tokens, dim))
-        self.register_buffer("mask_token", torch.zeros(1, 1, dim))
+        if patch_size_t > 1:
+            self.register_buffer("mask_token", torch.zeros(1, 1, dim))
         self.transformer_blocks = nn.ModuleList(
             [
                 MiniMaxH3VideoTransformerBlock(
@@ -628,9 +620,13 @@ class MiniMaxH3VideoViTDecoder3d(nn.Module):
             2.0 * (torch.arange(0.5, size, dtype=torch.float32, device=hidden_states.device) / size) - 1.0
             for size in (num_frames, height, width)
         ]
-        position_ids = torch.stack(torch.meshgrid(*grids, indexing="ij"), dim=-1).flatten(0, 2)
+        if self.rope_axes == 2:  # an image decoder: one frame, no time coordinate
+            grids = grids[1:]
+        elif self.patch_size_t == 1:  # a single-frame decoder keeps the time of the first latent of a 7-latent clip
+            grids[0] = torch.full((1,), 2.0 * (0.5 / 7) - 1.0, dtype=torch.float32, device=hidden_states.device)
+        position_ids = torch.stack(torch.meshgrid(*grids, indexing="ij"), dim=-1).flatten(0, len(grids) - 1)
         position_ids = position_ids.unsqueeze(0).expand(batch_size, -1, -1)
-        suffix_ids = position_ids.new_zeros((batch_size, self.num_register_tokens + 1, 3))
+        suffix_ids = position_ids.new_zeros((batch_size, self.num_register_tokens + 1, self.rope_axes))
         position_ids = torch.cat([position_ids, suffix_ids], dim=1)
         rotary_emb = self.rope(position_ids)
 
@@ -708,6 +704,8 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
         decoder_rope_theta: float = 100.0,
         decoder_rope_dim_ratio: float = 0.75,
         decoder_norm_eps: float = 1e-5,
+        decoder_patch_size_t: int | None = None,
+        decoder_rope_axes: int = 3,
         clip_length: int = 17,
         token_drop: int = 3,
         latents_mean: tuple[float, ...] = (0.0,) * 24,
@@ -735,7 +733,7 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
             in_channels=latent_channels,
             out_channels=out_channels,
             patch_size=self.spatial_compression_ratio,
-            patch_size_t=self.temporal_compression_ratio,
+            patch_size_t=decoder_patch_size_t or self.temporal_compression_ratio,
             num_layers=decoder_num_layers,
             num_attention_heads=decoder_num_attention_heads,
             attention_head_dim=decoder_attention_head_dim,
@@ -744,6 +742,7 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
             rope_theta=decoder_rope_theta,
             rope_dim_ratio=decoder_rope_dim_ratio,
             norm_eps=decoder_norm_eps,
+            rope_axes=decoder_rope_axes,
         )
 
         # Derived temporal-chunking geometry. `clip_length` pixel frames are encoded at a time; because
@@ -1007,8 +1006,12 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
         token_drop = self.config.token_drop
         temporal_ratio = self.temporal_compression_ratio
         chunk_num_frames = tokens_chunk_size * temporal_ratio
+        frame_pre_padding = self.frame_pre_padding
 
-        if z.shape[2] == 1:
+        if self.decoder.patch_size_t == 1:
+            # A single-frame decoder: one latent frame, one pixel frame.
+            num_chunks, output_frames, frame_pre_padding = 0, 1, 0
+        elif z.shape[2] == 1:
             # Fizgig H3 Still's decode recipe: five identical latents, then keep pixel frame 3.
             # https://github.com/shootthesound/ComfyUI-Fizgig-H3-Still (MIT)
             z = z.repeat(1, 1, tokens_chunk_size, 1, 1)
@@ -1046,13 +1049,13 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
                     part = self._prepare_decoded_chunk(chunk[:, :, start : min(start + 4, copy_frames)], uint8_rounding)
                     if decoded is None:
                         decoded = torch.empty(*part.shape[:2], output_frames, *part.shape[3:], dtype=part.dtype, device="cpu")
-                    decoded[:, :, write_position : write_position + part.shape[2]].copy_(part, non_blocking=False)
+                    transfer.copy_(decoded[:, :, write_position : write_position + part.shape[2]], part)
                     write_position += part.shape[2]
                     del part
 
             if num_chunks == 0:
                 # Short videos still need one decode, without an overlapping temporal chunk.
-                write_chunk(self._decode_clip(z)[:, :, self.frame_pre_padding : self.frame_pre_padding + output_frames])
+                write_chunk(self._decode_clip(z)[:, :, frame_pre_padding : frame_pre_padding + output_frames])
                 return decoded
 
             for i in range(num_chunks):
