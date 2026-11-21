@@ -122,6 +122,7 @@ from shared.utils import files_locator as fl
 from shared.gradio.strip_gallery import StripGallery, STRIP_GALLERY_CLASSES
 from shared.utils.gallery_sources import GALLERY_SOURCES, STRIP_SOURCES, VIDEO, MESH, WORLD, APP, gallery_source, source_index, source_for_path, gallery_state_defaults
 from shared.utils.self_refiner import normalize_self_refiner_plan, ensure_refiner_list, add_refiner_rule, remove_refiner_rule
+from shared.utils.copyfile import copyfile, save_file_to_cache
 from shared.deepy import controller as deepy_controller
 from shared.deepy.hybrid import HybridService, SharedState, service_for
 from shared.utils.generation_state import set_generation_state
@@ -2086,7 +2087,7 @@ def _load_task_attachments(params, media_base_path, cache_dir=None, log_prefix="
 
             if cache_dir:
                 try:
-                    final_path = gr.processing_utils.save_file_to_cache(source_path, cache_dir)
+                    final_path = save_file_to_cache(source_path, cache_dir)
                 except Exception as e:
                     print(f"{log_prefix} Error copying {filename}: {e}")
                     continue
@@ -15395,10 +15396,32 @@ if __name__ == "__main__":
             runner = lambda deps: run_server(deps, args)
         sys.exit(runner(_deepy_runtime_deps()))
 
-    # CLI Queue Processing Mode
     if len(args.process) > 0:
         download_ffmpeg()  # Still needed for video encoding
+    # end if
 
+    def _input_with_timeout(prompt, timeout):
+        result = [None]
+        interrupted = [False]
+        event = threading.Event()
+
+        def _reader():
+            try:
+                result[0] = input(prompt)
+            except KeyboardInterrupt:
+                interrupted[0] = True
+            finally:
+                event.set()
+
+        thread = threading.Thread(target=_reader, daemon=True)
+        thread.start()
+        event.wait(timeout=timeout)
+        if interrupted[0]:
+            raise KeyboardInterrupt
+        return result[0]
+
+    # CLI Queue Processing Mode
+    while len(args.process) > 0:
         if not os.path.isfile(args.process):
             print(f"[ERROR] File not found: {args.process}")
             sys.exit(1)
@@ -15486,7 +15509,12 @@ if __name__ == "__main__":
         try:
             sys.stdout = StatusLineStream(sys.stdout)
             success = process_tasks_cli(queue, state)
-            sys.exit(0 if success else 1)
+            if not success:
+                sys.exit(1)
+            # end if
+            if _input_with_timeout("press ENTER to handle next queue file, or CTRL+C to exit (timeout: 30 min)", 1800) is None:
+                print("\n\nTimeout: no input for 30 minutes, exiting.")
+                sys.exit(0)
         except KeyboardInterrupt:
             print("\n\nAborted by user")
             sys.exit(130)
@@ -15563,6 +15591,20 @@ if __name__ == "__main__":
         else:
             url = "http://" + server_name
         webbrowser.open(url + ":" + str(server_port), new = 0, autoraise = True)
+
+    # Gradio passes app_kwargs to the FastAPI app, not to uvicorn, so
+    # timeout_keep_alive is ignored. Patch uvicorn.Config to inject it.
+    import uvicorn
+    from uvicorn.config import Config as UvicornConfig
+
+    _orig_uvicorn_config_init = UvicornConfig.__init__
+
+    def _uvicorn_config_init_with_keepalive(self, app, **kwargs):
+        kwargs.setdefault("timeout_keep_alive", 86400)
+        _orig_uvicorn_config_init(self, app, **kwargs)
+
+    UvicornConfig.__init__ = _uvicorn_config_init_with_keepalive
+
     from shared.deepy.hybrid import launch_gradio
     launch_gradio(demo, _deepy_hybrid, args,
         favicon_path="favicon.png",
